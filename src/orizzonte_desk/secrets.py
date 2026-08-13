@@ -26,13 +26,24 @@ def _blob(data: bytes) -> tuple[DATA_BLOB, ctypes.Array[ctypes.c_char]]:
     return DATA_BLOB(len(data), ctypes.cast(buffer, ctypes.POINTER(ctypes.c_char))), buffer
 
 
+def _windows_dll() -> Any:
+    if os.name != "nt":
+        raise SecretStoreError("DPAPI está disponível somente no Windows")
+    return cast(Any, vars(ctypes)["windll"])
+
+
+def _last_error() -> int:
+    return int(cast(Any, vars(ctypes)["GetLastError"])())
+
+
 def protect(data: bytes, *, entropy: bytes = b"orizzonte-desk-v1") -> bytes:
     if os.name != "nt":
         raise SecretStoreError("DPAPI está disponível somente no Windows")
     input_blob, input_buffer = _blob(data)
     entropy_blob, entropy_buffer = _blob(entropy)
     output_blob = DATA_BLOB()
-    result = ctypes.windll.crypt32.CryptProtectData(
+    dll = _windows_dll()
+    result = dll.crypt32.CryptProtectData(
         ctypes.byref(input_blob),
         "Orizzonte Desk",
         ctypes.byref(entropy_blob),
@@ -43,11 +54,11 @@ def protect(data: bytes, *, entropy: bytes = b"orizzonte-desk-v1") -> bytes:
     )
     _ = input_buffer, entropy_buffer
     if not result:
-        raise SecretStoreError(f"CryptProtectData falhou: {ctypes.GetLastError()}")
+        raise SecretStoreError(f"CryptProtectData falhou: {_last_error()}")
     try:
         return ctypes.string_at(output_blob.pbData, output_blob.cbData)
     finally:
-        ctypes.windll.kernel32.LocalFree(output_blob.pbData)
+        dll.kernel32.LocalFree(output_blob.pbData)
 
 
 def unprotect(data: bytes, *, entropy: bytes = b"orizzonte-desk-v1") -> bytes:
@@ -56,7 +67,8 @@ def unprotect(data: bytes, *, entropy: bytes = b"orizzonte-desk-v1") -> bytes:
     input_blob, input_buffer = _blob(data)
     entropy_blob, entropy_buffer = _blob(entropy)
     output_blob = DATA_BLOB()
-    result = ctypes.windll.crypt32.CryptUnprotectData(
+    dll = _windows_dll()
+    result = dll.crypt32.CryptUnprotectData(
         ctypes.byref(input_blob),
         None,
         ctypes.byref(entropy_blob),
@@ -67,11 +79,11 @@ def unprotect(data: bytes, *, entropy: bytes = b"orizzonte-desk-v1") -> bytes:
     )
     _ = input_buffer, entropy_buffer
     if not result:
-        raise SecretStoreError(f"CryptUnprotectData falhou: {ctypes.GetLastError()}")
+        raise SecretStoreError(f"CryptUnprotectData falhou: {_last_error()}")
     try:
         return ctypes.string_at(output_blob.pbData, output_blob.cbData)
     finally:
-        ctypes.windll.kernel32.LocalFree(output_blob.pbData)
+        dll.kernel32.LocalFree(output_blob.pbData)
 
 
 class DPAPISecretStore:
