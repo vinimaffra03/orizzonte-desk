@@ -1,0 +1,23 @@
+services:
+  orizzonte:
+    build: .
+    restart: unless-stopped
+    # Linux VPS future: daemon remains bound to host loopback and is reached over SSH.
+    network_mode: host
+    volumes:
+      - ./data:/app/data
+      - ./models:/app/models
+      - ./reports:/app/reports
+      - ./logs:/app/logs
+      - ./state:/app/state
+      - ./.secrets:/app/.secrets
+    environment:
+      ORIZZONTE_HOME: /app
+    read_only: true
+    tmpfs:
+      - /tmp:size=256m
+      - /app/.tmp:size=256m
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL

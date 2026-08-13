@@ -1,0 +1,56 @@
+[app]
+locale = "pt_BR"
+timezone = "UTC"
+host = "127.0.0.1"
+port = 8790
+minimum_free_gb = 20.0
+
+[universe]
+symbols = ["BTC", "ETH", "SOL", "XRP"]
+base_interval = "1h"
+setup_interval = "4h"
+regime_intervals = ["1d", "1w"]
+
+[risk]
+leverage = 10
+isolated_margin = true
+risk_per_trade = 0.01
+aggregate_risk = 0.02
+max_positions = 2
+max_notional_multiple = 10.0
+correlation_threshold = 0.75
+daily_profit_lock = 0.01
+daily_loss_limit = 0.04
+max_drawdown_limit = 0.25
+margin_reserve = 0.20
+
+[strategy]
+fast_ema = 20
+slow_ema = 50
+donchian_window = 20
+atr_window = 14
+atr_stop_multiple = 1.5
+atr_trailing_multiple = 2.0
+partial_take_profit_r = 1.0
+partial_fraction = 0.5
+max_holding_hours = 240
+ml_probability_threshold = 0.58
+
+[execution]
+environment = "testnet"
+slippage_bps_btc_eth = 15.0
+slippage_bps_sol_xrp = 25.0
+taker_fee = 0.00045
+maker_fee = 0.00015
+dead_man_timeout_seconds = 30
+stale_data_seconds = 120
+
+[backtest]
+initial_capital = 10000.0
+start_date = "2021-01-01"
+training_months = 18
+validation_months = 3
+test_months = 3
+step_months = 3
+monte_carlo_samples = 2000
+random_seed = 42017
