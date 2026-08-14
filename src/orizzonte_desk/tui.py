@@ -1,7 +1,8 @@
 from __future__ import annotations
 
 import json
-from typing import Any, ClassVar
+from datetime import UTC, datetime
+from typing import Any, ClassVar, cast
 
 import httpx
 from rich.text import Text
@@ -164,7 +165,16 @@ class OrizzonteTUI(App[None]):
             "ATIVO", "MID", "REGIME 1D", "REGIME 1W", "VOL 24H", "FUNDING"
         )
         self.query_one("#signal-table", DataTable).add_columns(
-            "HORA UTC", "ATIVO", "LADO", "SCORE", "PROB.", "STATUS"
+            "HORA UTC",
+            "ATIVO",
+            "LADO",
+            "REGIME",
+            "ESTRATÉGIA",
+            "SCORE",
+            "PROB.",
+            "THRESHOLD",
+            "IDADE",
+            "STATUS",
         )
         self.query_one("#position-table", DataTable).add_columns(
             "ATIVO", "LADO", "TAMANHO", "ENTRADA", "STOP", "ALVO", "PNL"
@@ -221,9 +231,9 @@ class OrizzonteTUI(App[None]):
             market_table.add_row(
                 str(row.get("symbol", "—")),
                 f"{price:,.6g}",
-                "—",
-                "—",
-                "—",
+                str(row.get("regime_1d", row.get("daily_regime", row.get("regime", "—")))).upper(),
+                str(row.get("regime_1w", row.get("weekly_regime", "—"))).upper(),
+                _format_percent(row.get("volatility_24h", row.get("vol_24h"))),
                 f"{funding:.4%}",
             )
             ticker_values.append(f"{row.get('symbol')}  {price:,.6g}")
@@ -233,16 +243,44 @@ class OrizzonteTUI(App[None]):
         signal_table = self.query_one("#signal-table", DataTable)
         signal_table.clear()
         signal_value = metadata.get("signals", [])
+        decision_policy_value = metadata.get("decision_policy", {})
+        decision_policy = decision_policy_value if isinstance(decision_policy_value, dict) else {}
         for signal in signal_value if isinstance(signal_value, list) else []:
             if not isinstance(signal, dict):
                 continue
+            threshold = signal.get(
+                "decision_threshold",
+                decision_policy.get("probability_threshold", metadata.get("decision_threshold")),
+            )
+            evidence_time = (
+                signal.get("evidence_end")
+                or signal.get("decision_at")
+                or decision_policy.get("evidence_end")
+                or decision_policy.get("decision_at")
+                or metadata.get("evidence_end")
+                or metadata.get("decision_at")
+            )
             signal_table.add_row(
                 str(signal.get("timestamp", "—")),
                 str(signal.get("symbol", "—")),
                 str(signal.get("side", "—")).upper(),
+                str(signal.get("regime", metadata.get("regime", "—"))).upper(),
+                str(
+                    signal.get(
+                        "strategy",
+                        signal.get("setup", metadata.get("strategy", "—")),
+                    )
+                ).upper(),
                 f"{float(signal.get('score', 0)):.2f}",
                 f"{float(signal.get('probability', 0)):.1%}",
-                "APROVADO",
+                _format_threshold(threshold),
+                _format_age(evidence_time),
+                str(
+                    signal.get(
+                        "status",
+                        "APROVADO" if threshold is not None else "SEM POLÍTICA",
+                    )
+                ).upper(),
             )
 
         position_table = self.query_one("#position-table", DataTable)
@@ -318,14 +356,60 @@ class OrizzonteTUI(App[None]):
         release_id = str(
             metadata.get("release_id") or metadata.get("approved_release_id") or "NÃO APROVADA"
         )
+        certificate_value = metadata.get("testnet_certificate", {})
+        certificate = certificate_value if isinstance(certificate_value, dict) else {}
+        certificate_id = str(
+            certificate.get("certificate_id") or metadata.get("certificate_id") or "AUSENTE"
+        )
+        certificate_valid = certificate.get("valid", certificate.get("available", False))
+        authorization_value = metadata.get("mainnet_authorization", {})
+        authorization = authorization_value if isinstance(authorization_value, dict) else {}
+        authorization_id = str(
+            authorization.get("authorization_id") or metadata.get("authorization_id") or "AUSENTE"
+        )
+        authorization_status = str(
+            authorization.get(
+                "status",
+                "CONSUMIDA"
+                if authorization.get("consumed_at")
+                else "REVOGADA"
+                if authorization.get("revoked_at")
+                else "DISPONÍVEL"
+                if authorization.get("available")
+                else "BLOQUEADA",
+            )
+        ).upper()
+        management_value = metadata.get("protection_management", {})
+        if isinstance(management_value, dict):
+            management = str(
+                management_value.get("status") or management_value.get("last_action") or "PENDENTE"
+            ).upper()
+        else:
+            management = str(management_value or "PENDENTE").upper()
+        decision_at = decision_policy.get("decision_at") or metadata.get("decision_at") or "—"
+        evidence_end = decision_policy.get("evidence_end") or metadata.get("evidence_end")
+        decision_age = _age_seconds(evidence_end or decision_at)
+        policy_strategy = str(
+            decision_policy.get("strategy") or metadata.get("strategy") or "—"
+        ).upper()
+        policy_regime = str(decision_policy.get("regime") or metadata.get("regime") or "—").upper()
+        policy_threshold = _format_threshold(
+            decision_policy.get("probability_threshold", metadata.get("decision_threshold"))
+        )
         operations = [
             "[b #00d9ff]SAÚDE OPERACIONAL[/]",
             "Daemon: [#34d399]ONLINE[/]",
             f"Stream: [b]{stream_status}[/]",
             f"Reconciliação: [b]{reconciliation}[/]",
             f"Proteções nativas: [b]{protection}[/]",
+            f"Gestão de proteção: [b]{management}[/]",
             f"Release aprovada: [b]{release_id}[/]",
-            "Mainnet: [#fb7185]BLOQUEADA NESTA ENTREGA[/]",
+            f"Certificado testnet: [b]{certificate_id}[/] "
+            f"({'VÁLIDO' if certificate_valid else 'PENDENTE'})",
+            f"Autorização mainnet: [b]{authorization_status}[/] ({authorization_id})",
+            f"Política: [b]{policy_strategy} / {policy_regime} / {policy_threshold}[/]",
+            f"Decisão semanal: [b]{decision_at}[/]",
+            f"Idade da evidência: [b]{_format_seconds(decision_age)}[/]",
         ]
         self.query_one("#operations-content", Static).update("\n".join(operations))
         status_color = {
@@ -369,3 +453,43 @@ class OrizzonteTUI(App[None]):
 
 def run_tui() -> None:
     OrizzonteTUI().run()
+
+
+def _age_seconds(value: object) -> float | None:
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        timestamp = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if timestamp.tzinfo is None:
+        timestamp = timestamp.replace(tzinfo=UTC)
+    return max(0.0, (datetime.now(UTC) - timestamp.astimezone(UTC)).total_seconds())
+
+
+def _format_seconds(value: float | None) -> str:
+    if value is None:
+        return "—"
+    if value < 60:
+        return f"{value:.0f}s"
+    if value < 3600:
+        return f"{value / 60:.0f}m"
+    return f"{value / 3600:.1f}h"
+
+
+def _format_age(value: object) -> str:
+    return _format_seconds(_age_seconds(value))
+
+
+def _format_threshold(value: object) -> str:
+    try:
+        return f"{float(cast(Any, value)):.1%}"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _format_percent(value: object) -> str:
+    try:
+        return f"{float(cast(Any, value)):.2%}"
+    except (TypeError, ValueError):
+        return "—"

@@ -6,7 +6,11 @@ Esta checklist produz uma versão verificável e **não envia ordens mainnet**.
 
 - Sincronizar e auditar o histórico Binance com papel `development`.
 - Congelar configuração, seed, período e commit antes de obter o holdout.
-- Sincronizar a janela Hyperliquid com papel `external_holdout`.
+- Executar `research diagnose` e o challenger `research regimes` somente no development.
+- Confirmar threshold nested temporal, purge de 24h, bootstrap determinístico e
+  `DecisionPolicy` content-addressed. Fold sem LCB positivo deve ficar sem operar.
+- Rodar a v2 oficial duas vezes e comparar run ID, trades, equity, métricas e hashes.
+- Sincronizar a janela Hyperliquid como `external_holdout` somente se o gate longo passar.
 - Confirmar que nenhum comando de treino aceita o holdout.
 
 ## 2. Produzir o candidato
@@ -19,14 +23,7 @@ Esta checklist produz uma versão verificável e **não envia ordens mainnet**.
 - Gerar o gate combinado e promover somente o hash avaliado, no mesmo config/code/commit.
 - Se qualquer gate falhar, manter testnet/mainnet bloqueados e publicar o relatório negativo.
 
-## 3. Validar operação
-
-- Criar uma API wallet exclusiva para o processo.
-- Executar preflight e smoke somente no testnet, com saldo mock.
-- Verificar entrada, fill parcial, SL/TP reduce-only, restart, reconciliação e flatten.
-- Confirmar que não restaram ordens, posições ou proteções órfãs.
-
-## 4. Construir e aprovar a release
+## 3. Construir e aprovar a release
 
 Com o worktree limpo e todos os artefatos locais presentes:
 
@@ -39,10 +36,20 @@ uv run orizzonte release approve <release-id>
 A confirmação deve ser exatamente `APPROVE RELEASE <release-id>`. A aprovação vincula commit,
 configuração, modelo e gate por SHA-256. Qualquer alteração posterior invalida o preflight.
 
+## 4. Certificar testnet
+
+- Gerar uma API wallet testnet exclusiva com `secret generate --environment testnet`.
+- Executar preflight, smoke e caos somente no testnet, com saldo fornecido pelo operador.
+- Verificar entrada, fill parcial, duas proteções reduce-only, restart, reconciliação,
+  duplicatas, timeout após aceite, clock drift, stale data, falha de proteção, dead man's
+  switch e flatten.
+- Confirmar conta vazia ao final e `TestnetCertificate` válido, vinculado à release/modelo/gates.
+
 ## 5. Aceite
 
 - CI verde em Linux e Windows.
 - Nenhum segredo, dataset, modelo ou relatório versionado.
 - `orizzonte doctor`, `release verify` e `testnet preflight` aprovados.
 - Conta sem ordens/posições manuais.
-- Mainnet permanece desarmada. Uma sessão real exige uma decisão operacional futura e separada.
+- Mainnet permanece desarmada e sem capability. Autorização futura exige cofre mainnet
+  separado, certificado exato, confirmação completa, TTL de 15 minutos e budget ≤ 500 USDC.

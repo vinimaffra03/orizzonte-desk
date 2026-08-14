@@ -7,6 +7,7 @@ from typing import Any
 
 import websockets
 
+from orizzonte_desk import runtime_primitives as primitives
 from orizzonte_desk.constants import MAINNET_WS_URL, SYMBOLS, TESTNET_WS_URL
 from orizzonte_desk.models import Environment
 from orizzonte_desk.storage import StateStore
@@ -162,6 +163,8 @@ class HyperliquidStream:
             )
 
     def _handle_order(self, update: dict[str, Any]) -> None:
+        state = self.store.agent_state()
+        account = state.account_address or "paper"
         order = update.get("order", update)
         if not isinstance(order, dict):
             return
@@ -185,9 +188,13 @@ class HyperliquidStream:
             status=status,
             payload=update,
             exchange_order_id=str(exchange_order_id) if exchange_order_id is not None else None,
+            environment=state.environment,
+            account_address=account,
         )
 
     def _handle_fill(self, fill: dict[str, Any]) -> bool:
+        state = self.store.agent_state()
+        account = state.account_address or "paper"
         symbol = str(fill.get("coin", ""))
         size = abs(float(fill.get("sz", 0)))
         price = float(fill.get("px", 0))
@@ -203,14 +210,20 @@ class HyperliquidStream:
             filled_at = datetime.fromtimestamp(float(value) / 1000, tz=UTC).isoformat()
         else:
             filled_at = str(value or datetime.now(UTC).isoformat())
-        return self.store.record_fill(
-            fill_id,
-            symbol=symbol,
-            size=size,
-            price=price,
-            fee=abs(float(fill.get("fee", 0))),
-            payload=fill,
-            client_order_id=str(fill["cloid"]) if fill.get("cloid") else None,
-            exchange_order_id=str(fill["oid"]) if fill.get("oid") is not None else None,
-            filled_at=filled_at,
-        )
+
+        def record(event_id: str) -> bool:
+            return self.store.record_fill(
+                event_id,
+                symbol=symbol,
+                size=size,
+                price=price,
+                fee=abs(float(fill.get("fee", 0))),
+                payload=fill,
+                client_order_id=str(fill["cloid"]) if fill.get("cloid") else None,
+                exchange_order_id=str(fill["oid"]) if fill.get("oid") is not None else None,
+                filled_at=filled_at,
+                environment=state.environment,
+                account_address=account,
+            )
+
+        return primitives.persist_once(fill_id, record)

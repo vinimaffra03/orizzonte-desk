@@ -63,6 +63,41 @@ def _gateway(app_paths) -> HyperliquidGateway:
     return gateway
 
 
+def test_snapshot_uses_frontend_orders_required_for_native_protection(app_paths) -> None:
+    gateway = _gateway(app_paths)
+
+    class Info:
+        def user_state(self, _address: str) -> dict[str, Any]:
+            return {
+                "assetPositions": [],
+                "marginSummary": {"accountValue": "10000"},
+                "withdrawable": "10000",
+            }
+
+        def frontend_open_orders(self, _address: str) -> list[dict[str, Any]]:
+            return [
+                {
+                    "coin": "BTC",
+                    "side": "A",
+                    "sz": "0.1",
+                    "reduceOnly": True,
+                    "orderType": "Stop Market",
+                }
+            ]
+
+        def open_orders(self, _address: str) -> list[dict[str, Any]]:
+            raise AssertionError("basic openOrders cannot prove reduce-only SL/TP")
+
+        def all_mids(self) -> dict[str, str]:
+            return {"BTC": "60000"}
+
+    gateway.info = Info()
+    snapshot = gateway.snapshot()
+
+    assert snapshot.open_orders[0]["reduceOnly"] is True
+    assert snapshot.open_orders[0]["orderType"] == "Stop Market"
+
+
 def test_partial_fill_protection_uses_actual_filled_quantity(app_paths) -> None:
     gateway = _gateway(app_paths)
     exchange = _PartialFillExchange()
@@ -78,7 +113,15 @@ def test_partial_fill_protection_uses_actual_filled_quantity(app_paths) -> None:
     )
     assert result["filled_size"] == 0.4
     assert exchange.protection_sizes == [0.4, 0.4]
-    assert len(gateway.store.fills()) == 1
+    assert (
+        len(
+            gateway.store.fills(
+                environment=Environment.TESTNET,
+                account_address=gateway.account_address,
+            )
+        )
+        == 1
+    )
 
 
 def test_deterministic_cloid_is_stable_and_16_bytes() -> None:

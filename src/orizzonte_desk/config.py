@@ -61,7 +61,6 @@ class StrategyConfig(FrozenModel):
     partial_take_profit_r: float = Field(default=1.0, gt=0)
     partial_fraction: float = Field(default=0.5, gt=0, lt=1)
     max_holding_hours: int = Field(default=240, ge=24)
-    ml_probability_threshold: float = Field(default=0.58, ge=0.5, le=0.9)
 
     @model_validator(mode="after")
     def validate_emas(self) -> StrategyConfig:
@@ -91,6 +90,44 @@ class BacktestConfig(FrozenModel):
     random_seed: int = 42017
 
 
+class ResearchConfig(FrozenModel):
+    inner_validation_fraction: float = Field(default=0.20, ge=0.10, le=0.40)
+    purge_hours: int = Field(default=24, ge=1)
+    threshold_quantiles: tuple[float, ...] = (
+        0.50,
+        0.55,
+        0.60,
+        0.65,
+        0.70,
+        0.75,
+        0.80,
+        0.85,
+        0.90,
+        0.95,
+    )
+    threshold_min_validation_trades: int = Field(default=30, ge=30)
+    threshold_bootstrap_samples: int = Field(default=1000, ge=500)
+    threshold_lcb_quantile: float = Field(default=0.05, gt=0, lt=0.5)
+    regime_primary_lookback_weeks: int = Field(default=26, ge=13)
+    regime_sensitivity_weeks: tuple[int, ...] = (13, 26, 52)
+    weekly_decision_weekday: Literal[0] = 0
+    weekly_decision_hour_utc: Literal[0] = 0
+    weekly_decision_minute_utc: Literal[5] = 5
+
+
+class MainnetPolicyConfig(FrozenModel):
+    authorization_ttl_seconds: int = Field(default=900, ge=300, le=1800)
+    initial_budget_cap_usdc: float = Field(default=500.0, gt=0, le=500.0)
+    require_testnet_certificate: Literal[True] = True
+
+
+class OperationsConfig(FrozenModel):
+    backup_retention: int = Field(default=30, ge=7, le=90)
+    log_max_bytes: int = Field(default=52_428_800, ge=1_048_576)
+    log_backup_count: int = Field(default=10, ge=3, le=30)
+    watchdog_interval_seconds: int = Field(default=30, ge=10, le=300)
+
+
 class Settings(FrozenModel):
     app: AppConfig
     universe: UniverseConfig
@@ -98,6 +135,9 @@ class Settings(FrozenModel):
     strategy: StrategyConfig
     execution: ExecutionConfig
     backtest: BacktestConfig
+    research: ResearchConfig = ResearchConfig()
+    mainnet: MainnetPolicyConfig = MainnetPolicyConfig()
+    operations: OperationsConfig = OperationsConfig()
 
     @classmethod
     def load(cls, path: Path | None = None) -> Settings:

@@ -15,6 +15,7 @@ from hyperliquid.info import Info
 from hyperliquid.utils import constants
 from hyperliquid.utils.types import Cloid
 
+from orizzonte_desk import runtime_primitives as primitives
 from orizzonte_desk.constants import SYMBOLS
 from orizzonte_desk.models import Environment, Side, Signal
 from orizzonte_desk.storage import StateStore
@@ -89,6 +90,8 @@ class TradingGateway(Protocol):
     def flatten_all(self, *, slippage: float = 0.01) -> list[dict[str, Any]]: ...
 
     def schedule_dead_man(self, timeout_seconds: int) -> dict[str, Any]: ...
+
+    def clear_dead_man(self) -> dict[str, Any]: ...
 
 
 def _floor(value: float, increment: float) -> float:
@@ -165,7 +168,10 @@ class HyperliquidGateway:
 
     def snapshot(self) -> AccountSnapshot:
         state = self.info.user_state(self.account_address)
-        orders = self.info.open_orders(self.account_address)
+        # The basic openOrders shape omits reduceOnly/orderType.  Those fields are
+        # mandatory for the fail-closed native SL/TP invariant, so reconciliation
+        # must use the richer official frontendOpenOrders snapshot.
+        orders = self.info.frontend_open_orders(self.account_address)
         positions = tuple(
             item["position"]
             for item in state.get("assetPositions", [])
@@ -220,8 +226,13 @@ class HyperliquidGateway:
             self.asset_metadata(symbol)
         fees = self.info.user_fees(self.account_address)
         skew = self._clock_skew_seconds()
-        if skew > 5:
-            raise ExchangeError(f"Clock drift excessivo: {skew:.2f}s")
+        try:
+            primitives.enforce_time_guard(
+                clock_skew_seconds=skew,
+                max_clock_skew_seconds=5,
+            )
+        except primitives.RuntimeInvariantError as exc:
+            raise ExchangeError(str(exc)) from exc
         return {
             "environment": self.environment.value,
             "account_address": self.account_address,
@@ -253,11 +264,18 @@ class HyperliquidGateway:
         is_buy = signal.side is Side.LONG
         entry_cloid = cloid_for_key(idempotency_key) if idempotency_key else client_order_id()
         entry_cloid_text = _cloid_text(entry_cloid)
-        if self.store and self.store.order(entry_cloid_text):
+        if self.store and self.store.order(
+            entry_cloid_text,
+            environment=self.environment,
+            account_address=self.account_address,
+        ):
             tracked = next(
                 (
                     item["payload"]
-                    for item in self.store.positions()
+                    for item in self.store.positions(
+                        environment=self.environment,
+                        account_address=self.account_address,
+                    )
                     if item["symbol"] == signal.symbol
                 ),
                 None,
@@ -266,21 +284,35 @@ class HyperliquidGateway:
             position = next(
                 (item for item in recovered.positions if item.get("coin") == signal.symbol), None
             )
-            owned = isinstance(tracked, dict) and tracked.get("entryCloid") == entry_cloid_text
-            if position and not owned:
+            tracked_cloid = str(tracked.get("entryCloid")) if isinstance(tracked, dict) else None
+            recovered_size = (
+                metadata.normalize_size(abs(float(position.get("szi", 0)))) if position else 0.0
+            )
+            protections = [
+                item
+                for item in recovered.open_orders
+                if item.get("coin") == signal.symbol
+                and item.get("reduceOnly")
+                and float(item.get("sz", item.get("size", recovered_size))) >= recovered_size
+            ]
+            recovery_action = primitives.timeout_recovery_action(
+                expected_cloid=entry_cloid_text,
+                tracked_entry_cloid=tracked_cloid,
+                recovered_position_size=recovered_size,
+                protection_count=(
+                    2
+                    if position
+                    and primitives.has_native_protection_pair(position, recovered.open_orders)
+                    else 0
+                ),
+            )
+            if recovery_action == "reject_unowned":
                 raise ExchangeError(
                     "Posição do símbolo não pertence ao CLOID idempotente; retry recusado"
                 )
-            if position and owned:
-                recovered_size = metadata.normalize_size(abs(float(position.get("szi", 0))))
-                protections = [
-                    item
-                    for item in recovered.open_orders
-                    if item.get("coin") == signal.symbol
-                    and item.get("reduceOnly")
-                    and float(item.get("sz", item.get("size", recovered_size))) >= recovered_size
-                ]
-                if len(protections) < 2:
+            if recovery_action in {"protect", "reuse"}:
+                assert position is not None
+                if recovery_action == "protect":
                     protections = self.replace_protection(
                         signal.symbol,
                         side=signal.side,
@@ -307,6 +339,8 @@ class HyperliquidGateway:
                 side=signal.side.value,
                 status="submitting",
                 payload={"requested_size": normalized_size, "kind": "entry"},
+                environment=self.environment,
+                account_address=self.account_address,
             )
         entry = self.exchange.market_open(
             signal.symbol,
@@ -326,7 +360,11 @@ class HyperliquidGateway:
             )
             filled_size = abs(float(current.get("szi", 0))) if current else 0.0
             average_price = float(current.get("entryPx", 0)) if current else 0.0
-        filled_size = metadata.normalize_size(min(filled_size, normalized_size))
+        filled_size = primitives.protection_size_for_fill(
+            requested_size=normalized_size,
+            observed_filled_size=filled_size,
+            normalizer=metadata.normalize_size,
+        )
         if filled_size <= 0:
             if self.store:
                 self.store.upsert_order(
@@ -336,6 +374,8 @@ class HyperliquidGateway:
                     status="unfilled",
                     payload=cast(dict[str, Any], entry),
                     exchange_order_id=exchange_order_id,
+                    environment=self.environment,
+                    account_address=self.account_address,
                 )
             raise ExchangeError("Entrada não confirmou quantidade preenchida; proteção não enviada")
         if self.store:
@@ -346,6 +386,8 @@ class HyperliquidGateway:
                 status="filled" if filled_size >= normalized_size else "partially_filled",
                 payload={"response": entry, "filled_size": filled_size},
                 exchange_order_id=exchange_order_id,
+                environment=self.environment,
+                account_address=self.account_address,
             )
             self.store.record_fill(
                 f"entry:{entry_cloid_text}:{filled_size}",
@@ -355,6 +397,8 @@ class HyperliquidGateway:
                 payload={"synthetic_from_order_response": True, "response": entry},
                 client_order_id=entry_cloid_text,
                 exchange_order_id=exchange_order_id,
+                environment=self.environment,
+                account_address=self.account_address,
             )
         try:
             protections = self._place_protections(
@@ -394,11 +438,19 @@ class HyperliquidGateway:
                     "Proteção falhou e o fechamento emergencial não foi confirmado; "
                     "lock persistente acionado"
                 ) from close_exc
-            if residual:
+            failure_action = primitives.protection_failure_action(
+                protection_confirmed=False,
+                flatten_confirmed=residual is None,
+            )
+            if failure_action == "lock_unconfirmed":
                 raise ExchangeError(
                     "Proteção falhou e fechamento emergencial deixou posição residual"
                 ) from exc
-            raise ExchangeError("Proteção nativa falhou; posição fechada imediatamente") from exc
+            if failure_action == "flatten_and_lock":
+                raise ExchangeError(
+                    "Proteção nativa falhou; posição fechada imediatamente"
+                ) from exc
+            raise ExchangeError("Decisão insegura após falha de proteção") from exc
         return {
             "leverage": leverage_response,
             "entry": entry,
@@ -481,7 +533,11 @@ class HyperliquidGateway:
             self._assert_ok(response, "flatten")
             responses.append(response)
         if self.store:
-            self.store.replace_positions([])
+            self.store.replace_positions(
+                [],
+                environment=self.environment,
+                account_address=self.account_address,
+            )
         return responses
 
     def schedule_dead_man(self, timeout_seconds: int) -> dict[str, Any]:
@@ -490,6 +546,11 @@ class HyperliquidGateway:
         cancel_at = int((time.time() + timeout_seconds) * 1000)
         response = self.exchange.schedule_cancel(cancel_at)
         self._assert_ok(response, "dead man's switch")
+        return cast(dict[str, Any], response)
+
+    def clear_dead_man(self) -> dict[str, Any]:
+        response = self.exchange.schedule_cancel(0)
+        self._assert_ok(response, "limpeza do dead man's switch")
         return cast(dict[str, Any], response)
 
     def _place_protections(
@@ -526,12 +587,18 @@ class HyperliquidGateway:
                     side=(Side.SHORT if is_buy else Side.LONG).value,
                     status="open",
                     payload={"kind": kind, "size": size, "price": price, "response": response},
+                    environment=self.environment,
+                    account_address=self.account_address,
                 )
         return protections
 
     def _persist_snapshot(self, snapshot: AccountSnapshot) -> None:
         assert self.store is not None
-        self.store.replace_positions(list(snapshot.positions))
+        self.store.replace_positions(
+            list(snapshot.positions),
+            environment=self.environment,
+            account_address=self.account_address,
+        )
         for order in snapshot.open_orders:
             cloid = str(order.get("cloid") or f"oid:{order.get('oid')}")
             side = str(order.get("side") or order.get("dir") or "unknown").lower()
@@ -542,6 +609,8 @@ class HyperliquidGateway:
                 status="open",
                 payload=order,
                 exchange_order_id=str(order["oid"]) if order.get("oid") is not None else None,
+                environment=self.environment,
+                account_address=self.account_address,
             )
 
     def _persist_fill(self, fill: dict[str, Any]) -> bool:
@@ -561,6 +630,8 @@ class HyperliquidGateway:
             client_order_id=str(fill["cloid"]) if fill.get("cloid") else None,
             exchange_order_id=str(fill["oid"]) if fill.get("oid") is not None else None,
             filled_at=_timestamp_text(fill.get("time")),
+            environment=self.environment,
+            account_address=self.account_address,
         )
 
     @staticmethod
@@ -911,6 +982,9 @@ class PaperGateway:
 
     def schedule_dead_man(self, timeout_seconds: int) -> dict[str, Any]:
         return {"status": "ok", "paper": True, "timeout_seconds": timeout_seconds}
+
+    def clear_dead_man(self) -> dict[str, Any]:
+        return {"status": "ok", "paper": True, "cleared": True}
 
     def _paper_protections(
         self,

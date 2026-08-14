@@ -38,6 +38,7 @@ REPORT_TEMPLATE = """<!doctype html>
 <section class="panel"><h2>Por ativo</h2><table><thead><tr><th>Ativo</th><th>PnL</th><th>Trades</th><th>Win rate</th><th>Profit factor</th></tr></thead><tbody>{% for symbol, row in by_symbol.items() %}<tr><td>{{ symbol }}</td><td>{{ '%.2f'|format(row.net_pnl) }}</td><td>{{ row.trades|int }}</td><td>{{ '%.1f%%'|format(row.win_rate*100) }}</td><td>{{ '%.2f'|format(row.profit_factor) }}</td></tr>{% endfor %}</tbody></table></section>
 <section class="panel"><h2>Por direção</h2><table><thead><tr><th>Direção</th><th>PnL</th><th>Trades</th><th>Expectância</th><th>Custos</th></tr></thead><tbody>{% for direction, row in by_direction.items() %}<tr><td>{{ direction }}</td><td>{{ '%.2f'|format(row.net_pnl) }}</td><td>{{ row.trades|int }}</td><td>{{ '%.2f'|format(row.expectancy) }}</td><td>{{ '%.2f'|format(row.fees + row.funding + row.slippage) }}</td></tr>{% endfor %}</tbody></table></section>
 <section class="panel"><h2>Stress e sensibilidade</h2><table><thead><tr><th>Cenário</th><th>Retorno</th><th>Drawdown</th><th>Expectância</th><th>Profit factor</th></tr></thead><tbody>{% for scenario, row in stress_results.items() %}<tr><td>{{ scenario }}</td><td>{{ '%.2f%%'|format(row.total_return*100) }}</td><td>{{ '%.2f%%'|format(row.max_drawdown*100) }}</td><td>{{ '%.2f'|format(row.expectancy) }}</td><td>{{ '%.2f'|format(row.profit_factor) }}</td></tr>{% endfor %}</tbody></table></section>
+<section class="panel"><h2>DecisionPolicy e estudo de regimes</h2><pre>{{ research_manifest }}</pre></section>
 <section class="panel"><h2>Manifesto</h2><pre>{{ manifest }}</pre></section>
 <footer>O alvo de 1% ao dia é uma meta de pesquisa, não garantia de retorno. Resultados históricos não asseguram resultados futuros.</footer>
 </body></html>"""
@@ -51,7 +52,16 @@ def generate_report(result: BacktestResult) -> Path:
     output_dir = result.gate_path.parent
     output_dir.mkdir(parents=True, exist_ok=True)
     metrics = result.metrics.summary
-    gate = json.loads(result.gate_path.read_text(encoding="utf-8"))
+    gate = (
+        json.loads(result.gate_path.read_text(encoding="utf-8"))
+        if result.gate_path.exists()
+        else {
+            "passed": False,
+            "checks": {"gate_eligible": False},
+            "reasons": ["research_baseline_not_gate_eligible"],
+            "release_binding": {"gate_eligible": False},
+        }
+    )
     equity = result.equity.copy()
     equity["timestamp"] = pd.to_datetime(equity["timestamp"], utc=True)
     drawdown = equity["equity"] / equity["equity"].cummax() - 1
@@ -102,6 +112,22 @@ def generate_report(result: BacktestResult) -> Path:
         "by_direction": result.metrics.by_direction,
         "artifacts": {key: str(value) for key, value in result.artifacts.items()},
     }
+    gate_binding_value = gate.get("release_binding", {})
+    gate_binding = gate_binding_value if isinstance(gate_binding_value, dict) else {}
+    regime_path = result.artifacts.get("regime_study")
+    regime_summary = (
+        json.loads(regime_path.read_text(encoding="utf-8"))
+        if regime_path is not None and regime_path.exists()
+        else {}
+    )
+    research_manifest = {
+        "decision_policy_id": gate_binding.get("decision_policy_id"),
+        "decision_policy_hash": gate_binding.get("decision_policy_hash"),
+        "regime_study": regime_summary,
+        "challenger_gate_eligible": False,
+        "challenger_promotion_eligible": False,
+    }
+    manifest["research_v2"] = research_manifest
     html = (
         Environment(undefined=StrictUndefined, autoescape=True)
         .from_string(REPORT_TEMPLATE)
@@ -113,6 +139,7 @@ def generate_report(result: BacktestResult) -> Path:
             by_symbol=result.metrics.by_symbol,
             by_direction=result.metrics.by_direction,
             stress_results=result.stress_results,
+            research_manifest=json.dumps(research_manifest, indent=2, ensure_ascii=False),
             manifest=json.dumps(manifest, indent=2, ensure_ascii=False),
         )
     )

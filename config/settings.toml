@@ -34,7 +34,6 @@ atr_trailing_multiple = 2.0
 partial_take_profit_r = 1.0
 partial_fraction = 0.5
 max_holding_hours = 240
-ml_probability_threshold = 0.58
 
 [execution]
 environment = "testnet"
@@ -54,3 +53,27 @@ test_months = 3
 step_months = 3
 monte_carlo_samples = 2000
 random_seed = 42017
+
+[research]
+inner_validation_fraction = 0.20
+purge_hours = 24
+threshold_quantiles = [0.50, 0.55, 0.60, 0.65, 0.70, 0.75, 0.80, 0.85, 0.90, 0.95]
+threshold_min_validation_trades = 30
+threshold_bootstrap_samples = 1000
+threshold_lcb_quantile = 0.05
+regime_primary_lookback_weeks = 26
+regime_sensitivity_weeks = [13, 26, 52]
+weekly_decision_weekday = 0
+weekly_decision_hour_utc = 0
+weekly_decision_minute_utc = 5
+
+[mainnet]
+authorization_ttl_seconds = 900
+initial_budget_cap_usdc = 500.0
+require_testnet_certificate = true
+
+[operations]
+backup_retention = 30
+log_max_bytes = 52428800
+log_backup_count = 10
+watchdog_interval_seconds = 30

@@ -6,6 +6,7 @@ from typing import Any, cast
 import httpx
 import pandas as pd
 
+from orizzonte_desk import runtime_primitives as primitives
 from orizzonte_desk.config import Settings
 from orizzonte_desk.constants import MAINNET_API_URL, SYMBOLS, TESTNET_API_URL
 from orizzonte_desk.controller import AgentController
@@ -37,7 +38,7 @@ class TradingEngine:
 
     def tick(self) -> dict[str, Any]:
         state = self.store.agent_state()
-        if state.status is not AgentStatus.RUNNING:
+        if state.status not in {AgentStatus.RUNNING, AgentStatus.PAUSED, AgentStatus.LOCKED}:
             return {"acted": False, "reason": f"state:{state.status}"}
         if state.budget_usdc is None:
             raise RuntimeError("Agente rodando sem orçamento")
@@ -46,11 +47,17 @@ class TradingEngine:
         market = self._market_window(state.environment)
         newest = pd.to_datetime(market["timestamp"], utc=True).max()
         now = pd.Timestamp.now(tz="UTC")
-        if (now - newest).total_seconds() > self.settings.execution.stale_data_seconds + 3600:
-            raise RuntimeError(f"Market data stale: {newest.isoformat()}")
+        try:
+            primitives.enforce_time_guard(
+                data_age_seconds=(now - newest).total_seconds(),
+                max_data_age_seconds=self.settings.execution.stale_data_seconds + 3600,
+            )
+        except primitives.RuntimeInvariantError as exc:
+            raise RuntimeError(f"Market data stale: {newest.isoformat()}") from exc
         metadata = dict(state.metadata)
         last_signal_bar = metadata.get("last_signal_bar")
         gateway = self.controller.gateway(state.environment)
+        scope_account = state.account_address or "paper"
         updater = getattr(gateway, "update_market", None)
         if callable(updater):
             for row in latest_rows(market):
@@ -61,10 +68,27 @@ class TradingEngine:
                     event_id=f"{row['symbol']}:{pd.Timestamp(row['timestamp']).isoformat()}",
                 )
         account = gateway.reconcile()
-        self._audit_position_protections(gateway, account.positions)
-        management_actions = self._manage_positions(gateway, account.positions, market)
+        self._audit_position_protections(
+            gateway,
+            account.positions,
+            environment=state.environment,
+            account_address=scope_account,
+        )
+        management_actions = self._manage_positions(
+            gateway,
+            account.positions,
+            market,
+            environment=state.environment,
+            account_address=scope_account,
+        )
         if management_actions:
             account = gateway.reconcile()
+        if state.status is not AgentStatus.RUNNING:
+            return {
+                "acted": bool(management_actions),
+                "reason": f"management_only:{state.status.value}",
+                "actions": management_actions,
+            }
         if last_signal_bar == newest.isoformat():
             return {
                 "acted": bool(management_actions),
@@ -193,9 +217,12 @@ class TradingEngine:
                     if signal.symbol in {"BTC", "ETH"}
                     else self.settings.execution.slippage_bps_sol_xrp
                 ) / 10_000
-                intent = (
-                    f"{state.environment.value}:{newest.isoformat()}:{signal.symbol}:"
-                    f"{signal.side.value}:{state.metadata.get('release_id', 'paper')}"
+                intent = primitives.deterministic_intent_key(
+                    environment=state.environment.value,
+                    bar=newest.isoformat(),
+                    symbol=signal.symbol,
+                    side=signal.side.value,
+                    release_id=str(state.metadata.get("release_id", "paper")),
                 )
                 intent_cloid = str(cloid_for_key(intent))
                 self.store.upsert_order(
@@ -204,6 +231,8 @@ class TradingEngine:
                     side=signal.side.value,
                     status="intent",
                     payload={"bar": newest.isoformat(), "intent": intent},
+                    environment=state.environment,
+                    account_address=scope_account,
                 )
                 response = gateway.place_entry_with_protection(
                     signal,
@@ -255,6 +284,8 @@ class TradingEngine:
                         "regime": signal.regime,
                         "entryCloid": response.get("entry_cloid"),
                     },
+                    environment=state.environment,
+                    account_address=scope_account,
                 )
                 current_positions.append(tracked_position)
                 if len(current_positions) >= self.settings.risk.max_positions:
@@ -318,21 +349,35 @@ class TradingEngine:
         if not isinstance(last_event, str):
             raise RuntimeError("Streaming sem timestamp de atividade")
         age = (datetime.now(UTC) - datetime.fromisoformat(last_event)).total_seconds()
-        if age > self.settings.execution.stale_data_seconds:
+        try:
+            primitives.enforce_time_guard(
+                data_age_seconds=age,
+                max_data_age_seconds=self.settings.execution.stale_data_seconds,
+            )
+        except primitives.RuntimeInvariantError as exc:
             self.store.latch_lock(
                 "connectivity",
                 reason="Streaming stale",
                 payload={"age_seconds": age},
             )
-            raise RuntimeError(f"Streaming stale há {age:.1f}s")
+            raise RuntimeError(f"Streaming stale há {age:.1f}s") from exc
 
     def _manage_positions(
         self,
         gateway: Any,
         raw_positions: tuple[dict[str, Any], ...],
         market: pd.DataFrame,
+        *,
+        environment: Environment = Environment.PAPER,
+        account_address: str = "paper",
     ) -> list[dict[str, Any]]:
-        tracked = {item["symbol"]: item["payload"] for item in self.store.positions()}
+        tracked = {
+            item["symbol"]: item["payload"]
+            for item in self.store.positions(
+                environment=environment,
+                account_address=account_address,
+            )
+        }
         latest = {str(item["symbol"]): item for item in latest_rows(market)}
         actions: list[dict[str, Any]] = []
         now = datetime.now(UTC)
@@ -387,7 +432,12 @@ class TradingEngine:
                             "stopPx": entry,
                         }
                     )
-                    self.store.upsert_position(symbol, item)
+                    self.store.upsert_position(
+                        symbol,
+                        item,
+                        environment=environment,
+                        account_address=account_address,
+                    )
                     actions.append(
                         {
                             "symbol": symbol,
@@ -424,16 +474,32 @@ class TradingEngine:
                     take_profit_price=take_profit,
                 )
                 item["stopPx"] = new_stop
-                self.store.upsert_position(symbol, item)
+                self.store.upsert_position(
+                    symbol,
+                    item,
+                    environment=environment,
+                    account_address=account_address,
+                )
                 actions.append(
                     {"symbol": symbol, "action": "atr_trailing", "protections": protections}
                 )
         return actions
 
     def _audit_position_protections(
-        self, gateway: Any, raw_positions: tuple[dict[str, Any], ...]
+        self,
+        gateway: Any,
+        raw_positions: tuple[dict[str, Any], ...],
+        *,
+        environment: Environment = Environment.PAPER,
+        account_address: str = "paper",
     ) -> None:
-        tracked = {item["symbol"]: item["payload"] for item in self.store.positions()}
+        tracked = {
+            item["symbol"]: item["payload"]
+            for item in self.store.positions(
+                environment=environment,
+                account_address=account_address,
+            )
+        }
         snapshot = gateway.snapshot()
         for raw in raw_positions:
             symbol = str(raw.get("coin", ""))
@@ -447,14 +513,7 @@ class TradingEngine:
                 )
                 raise RuntimeError(f"Posição não atribuída ao agente: {symbol}")
             size = abs(float(raw.get("szi", 0)))
-            protections = [
-                item
-                for item in snapshot.open_orders
-                if item.get("coin") == symbol
-                and bool(item.get("reduceOnly", False))
-                and float(item.get("sz", item.get("size", size))) >= size
-            ]
-            if len(protections) >= 2:
+            if primitives.has_native_protection_pair(raw, snapshot.open_orders):
                 continue
             side = Side.LONG if float(raw.get("szi", 0)) > 0 else Side.SHORT
             try:
@@ -479,17 +538,15 @@ class TradingEngine:
     def _assert_position_protected(gateway: Any, symbol: str) -> None:
         snapshot = gateway.snapshot()
         position = next((item for item in snapshot.positions if item.get("coin") == symbol), None)
-        protections = [
-            item
-            for item in snapshot.open_orders
-            if item.get("coin") == symbol and bool(item.get("reduceOnly", False))
-        ]
+        protection_pair = bool(
+            position and primitives.has_native_protection_pair(position, snapshot.open_orders)
+        )
         isolated = (
             isinstance(position, dict)
             and str(position.get("leverage", {}).get("type", "")) == "isolated"
         )
         leverage = int(position.get("leverage", {}).get("value", 0)) if position else 0
-        if not position or len(protections) < 2 or not isolated or leverage != 10:
+        if not position or not protection_pair or not isolated or leverage != 10:
             gateway.flatten_all(slippage=0.02)
             raise RuntimeError(
                 f"Entrada {symbol} sem confirmação de margem isolada 10x e duas proteções"
