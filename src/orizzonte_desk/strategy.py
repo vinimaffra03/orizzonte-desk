@@ -19,7 +19,13 @@ class SignalGenerator:
         self.config = config
         self.registry = registry
 
-    def enrich(self, market: pd.DataFrame, *, require_promoted_model: bool = False) -> pd.DataFrame:
+    def enrich(
+        self,
+        market: pd.DataFrame,
+        *,
+        require_promoted_model: bool = False,
+        model_bundle: dict[str, Any] | None = None,
+    ) -> pd.DataFrame:
         features = prepare_features(market, self.config)
         candidates = features["signal_raw"] != 0
         features["ml_probability"] = 0.0
@@ -31,12 +37,13 @@ class SignalGenerator:
             if self.registry is None:
                 probabilities = features.loc[candidates, "setup_score"].to_numpy()
             else:
-                probabilities = self.registry.predict(features.loc[candidates])
+                probabilities = self.registry.predict(features.loc[candidates], model_bundle)
             features.loc[candidates, "ml_probability"] = probabilities
         features["signal"] = features["signal_raw"].where(
             features["ml_probability"] >= self.config.ml_probability_threshold,
             0,
         )
+        features.attrs.update(market.attrs)
         return features
 
     def latest(self, market: pd.DataFrame, *, require_promoted_model: bool = False) -> list[Signal]:

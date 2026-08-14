@@ -19,8 +19,8 @@ from rich.table import Table
 
 from orizzonte_desk.backtest import EventBacktester, WalkForwardEvaluator
 from orizzonte_desk.config import Settings
-from orizzonte_desk.constants import APP_NAME
-from orizzonte_desk.controller import AgentController, ControlError
+from orizzonte_desk.constants import APP_NAME, LIVE_CONFIRMATION_PREFIX
+from orizzonte_desk.controller import AgentController
 from orizzonte_desk.daemon import create_app
 from orizzonte_desk.data import DatasetManager, DatasetManifest
 from orizzonte_desk.gates import load_combined_gate
@@ -47,6 +47,8 @@ report_app = typer.Typer(help="Relatórios quantitativos.")
 paper_app = typer.Typer(help="Controle do paper trading.")
 live_app = typer.Typer(help="Controle explícito de testnet/mainnet.")
 secret_app = typer.Typer(help="Cofre DPAPI local para a API wallet.")
+testnet_app = typer.Typer(help="Preflight, smoke e reconciliação controlados no testnet.")
+release_app = typer.Typer(help="Build, verificação e aprovação de releases imutáveis.")
 app.add_typer(data_app, name="data")
 app.add_typer(research_app, name="research")
 app.add_typer(backtest_app, name="backtest")
@@ -54,6 +56,8 @@ app.add_typer(report_app, name="report")
 app.add_typer(paper_app, name="paper")
 app.add_typer(live_app, name="live")
 app.add_typer(secret_app, name="secret")
+app.add_typer(testnet_app, name="testnet")
+app.add_typer(release_app, name="release")
 
 
 class DataSource(StrEnum):
@@ -74,6 +78,60 @@ def context() -> tuple[AppPaths, Settings, StateStore, AgentController]:
 def fail(message: str, code: int = 1) -> NoReturn:
     console.print(f"[bold red]ERRO[/] {message}")
     raise typer.Exit(code)
+
+
+def daemon_settings() -> tuple[AppPaths, Settings]:
+    """Load the loopback daemon address without opening the local state database."""
+    paths = AppPaths.discover()
+    return paths, Settings.load(paths.config)
+
+
+def daemon_request(
+    method: str,
+    endpoint: str,
+    *,
+    payload: dict[str, Any] | None = None,
+    timeout: float = 10.0,
+) -> Any:
+    """Call the local daemon and fail closed on unavailable/unsupported capabilities."""
+    _, settings = daemon_settings()
+    base_url = f"http://{settings.app.host}:{settings.app.port}"
+    try:
+        response = httpx.request(
+            method,
+            f"{base_url}{endpoint}",
+            json=payload,
+            timeout=timeout,
+        )
+    except httpx.RequestError as exc:
+        fail(
+            "Daemon local indisponível em "
+            f"{base_url}. Inicie `orizzonte daemon` e tente novamente ({exc.__class__.__name__})."
+        )
+    if not response.is_success:
+        detail: str
+        try:
+            body = response.json()
+            detail = str(body.get("detail", body)) if isinstance(body, dict) else str(body)
+        except ValueError:
+            detail = response.text.strip() or "sem detalhes"
+        if response.status_code == 404:
+            fail(
+                f"O daemon não oferece a capacidade {endpoint}. "
+                "Atualize o runtime antes de prosseguir; nenhuma ação foi executada."
+            )
+        fail(f"Daemon recusou {endpoint} (HTTP {response.status_code}): {detail}")
+    try:
+        return response.json()
+    except ValueError:
+        fail(f"Resposta inválida do daemon para {endpoint}; nenhuma confirmação foi aceita.")
+
+
+def daemon_state() -> dict[str, Any]:
+    state = daemon_request("GET", "/state")
+    if not isinstance(state, dict):
+        fail("Estado inválido recebido do daemon")
+    return state
 
 
 def print_state(state: Any) -> None:
@@ -177,31 +235,28 @@ def daemon() -> None:
 
 @app.command()
 def status() -> None:
-    """Mostra o estado operacional persistido."""
-    _, _, store, _ = context()
-    print_state(store.agent_state())
+    """Mostra o estado operacional fornecido pelo daemon local."""
+    print_state(daemon_state())
 
 
 @app.command()
 def positions() -> None:
-    _, _, store, controller = context()
-    state = store.agent_state()
-    snapshot = controller.gateway(state.environment).snapshot()
-    console.print_json(data=list(snapshot.positions))
+    state = daemon_state()
+    metadata = state.get("metadata", {})
+    console.print_json(data=list(metadata.get("positions", [])))
 
 
 @app.command()
 def orders() -> None:
-    _, _, store, controller = context()
-    state = store.agent_state()
-    snapshot = controller.gateway(state.environment).snapshot()
-    console.print_json(data=list(snapshot.open_orders))
+    state = daemon_state()
+    metadata = state.get("metadata", {})
+    console.print_json(data=list(metadata.get("orders", metadata.get("open_orders", []))))
 
 
 @app.command()
 def risk() -> None:
-    _, settings, store, _ = context()
-    state = store.agent_state()
+    _, settings = daemon_settings()
+    state = daemon_state()
     table = Table("Limite", "Valor", border_style="bright_black")
     values = {
         "Alavancagem": f"{settings.risk.leverage}× isolada",
@@ -210,7 +265,7 @@ def risk() -> None:
         "Meta diária": f"{settings.risk.daily_profit_lock:.2%}",
         "Stop diário": f"-{settings.risk.daily_loss_limit:.2%}",
         "Kill switch": f"-{settings.risk.max_drawdown_limit:.2%}",
-        "Orçamento armado": str(state.budget_usdc or "—"),
+        "Orçamento armado": str(state.get("budget_usdc") or "—"),
     }
     for key, value in values.items():
         table.add_row(key, value)
@@ -219,8 +274,10 @@ def risk() -> None:
 
 @app.command()
 def logs(limit: int = typer.Option(100, min=1, max=500)) -> None:
-    _, _, store, _ = context()
-    for event in reversed(store.recent_events(limit)):
+    events = daemon_request("GET", f"/events?limit={limit}")
+    if not isinstance(events, list):
+        fail("Lista de eventos inválida recebida do daemon")
+    for event in reversed(events):
         console.print(
             f"[dim]{event['timestamp']}[/] [cyan]{event['level']:<8}[/] "
             f"[bold]{event['category']}[/] {event['message']}"
@@ -371,6 +428,7 @@ def run_backtest(
     dataset_id: str | None,
     source_contains: str | None = None,
     stress_only: bool = False,
+    model_id: str | None = None,
 ) -> tuple[Any, Path]:
     paths, settings, _, _ = context()
     manager = DatasetManager(paths, settings)
@@ -383,6 +441,8 @@ def run_backtest(
     )
     if manifest is None:
         fail(f"Dataset não encontrado: {dataset_id}")
+    if getattr(manifest, "role", "development") == "external_holdout" and model_id is None:
+        fail("External holdout exige --model-id para vincular o gate ao candidato exato")
     with console.status("Executando simulador event-driven e Monte Carlo..."):
         market = manager.load(manifest.path)
         span_days = (
@@ -400,6 +460,7 @@ def run_backtest(
                 market,
                 source=manifest.source,
                 dataset_hash=manifest.sha256,
+                model_id=model_id,
                 cost_multiplier=2.0 if stress_only else 1.0,
                 signal_delay_hours=2 if stress_only else 1,
                 missing_fraction=0.005 if stress_only else 0,
@@ -409,16 +470,30 @@ def run_backtest(
 
 
 @backtest_app.command("run")
-def backtest_run(dataset_id: str | None = None) -> None:
-    result, report = run_backtest(dataset_id=dataset_id)
+def backtest_run(
+    dataset_id: str | None = None,
+    model_id: str | None = typer.Option(
+        None,
+        "--model-id",
+        help="Avalia um modelo candidato específico e vincula seu hash ao gate.",
+    ),
+) -> None:
+    result, report = run_backtest(dataset_id=dataset_id, model_id=model_id)
     console.print_json(
         data={"run_id": result.run_id, **result.metrics.summary, "report": str(report)}
     )
 
 
 @backtest_app.command("stress")
-def backtest_stress(dataset_id: str | None = None) -> None:
-    result, report = run_backtest(dataset_id=dataset_id, stress_only=True)
+def backtest_stress(
+    dataset_id: str | None = None,
+    model_id: str | None = typer.Option(
+        None,
+        "--model-id",
+        help="Avalia o stress de um modelo candidato específico.",
+    ),
+) -> None:
+    result, report = run_backtest(dataset_id=dataset_id, stress_only=True, model_id=model_id)
     console.print_json(
         data={"run_id": result.run_id, **result.metrics.summary, "report": str(report)}
     )
@@ -480,24 +555,22 @@ def report_export(destination: Path) -> None:
 
 
 def control_action(action: str) -> None:
-    _, _, _, controller = context()
-    try:
-        print_state(getattr(controller, action)())
-    except ControlError as exc:
-        fail(str(exc))
+    print_state(daemon_request("POST", f"/control/{action}"))
 
 
 @paper_app.command("start")
 def paper_start(budget_usdc: float = typer.Option(10_000.0, min=1)) -> None:
-    _, _, _, controller = context()
-    confirmation = controller.expected_confirmation(Environment.PAPER, budget_usdc)
-    try:
-        controller.arm(
-            environment=Environment.PAPER, budget_usdc=budget_usdc, confirmation=confirmation
-        )
-        print_state(controller.start())
-    except ControlError as exc:
-        fail(str(exc))
+    confirmation = f"{LIVE_CONFIRMATION_PREFIX} PAPER {budget_usdc:.2f}"
+    daemon_request(
+        "POST",
+        "/control/arm",
+        payload={
+            "environment": Environment.PAPER.value,
+            "budget_usdc": budget_usdc,
+            "confirmation": confirmation,
+        },
+    )
+    print_state(daemon_request("POST", "/control/start"))
 
 
 @paper_app.command("pause")
@@ -507,16 +580,13 @@ def paper_pause() -> None:
 
 @paper_app.command("stop")
 def paper_stop() -> None:
-    _, _, store, controller = context()
-    state = store.agent_state()
-    try:
-        if state.status is AgentStatus.RUNNING:
-            controller.pause()
-        if controller.gateway(state.environment).snapshot().positions:
-            controller.flatten()
-        print_state(controller.disarm())
-    except ControlError as exc:
-        fail(str(exc))
+    state = daemon_state()
+    if state.get("status") == AgentStatus.RUNNING.value:
+        daemon_request("POST", "/control/pause")
+    metadata = state.get("metadata", {})
+    if metadata.get("positions"):
+        daemon_request("POST", "/control/flatten")
+    print_state(daemon_request("POST", "/control/disarm"))
 
 
 @live_app.command("arm")
@@ -527,17 +597,17 @@ def live_arm(
 ) -> None:
     if environment is Environment.PAPER:
         fail("Use `orizzonte paper start` para paper trading")
-    _, _, _, controller = context()
-    try:
-        print_state(
-            controller.arm(
-                environment=environment,
-                budget_usdc=budget_usdc,
-                confirmation=confirm,
-            )
+    print_state(
+        daemon_request(
+            "POST",
+            "/control/arm",
+            payload={
+                "environment": environment.value,
+                "budget_usdc": budget_usdc,
+                "confirmation": confirm,
+            },
         )
-    except ControlError as exc:
-        fail(str(exc))
+    )
 
 
 @live_app.command("start")
@@ -565,3 +635,72 @@ def live_flatten(confirm: str = typer.Option(..., prompt=True)) -> None:
 @live_app.command("disarm")
 def live_disarm() -> None:
     control_action("disarm")
+
+
+@testnet_app.command("preflight")
+def testnet_preflight() -> None:
+    """Valida release, conta, conectividade e bloqueios sem enviar ordens."""
+    print_state(daemon_request("POST", "/testnet/preflight", timeout=30.0))
+
+
+@testnet_app.command("smoke")
+def testnet_smoke(
+    budget_usdc: float = typer.Option(25.0, min=1),
+    confirm: str = typer.Option(..., prompt=True),
+) -> None:
+    """Solicita ao daemon o smoke test controlado; nunca usa mainnet."""
+    expected = f"TESTNET SMOKE {budget_usdc:.2f}"
+    if confirm != expected:
+        fail(f"Confirmação inválida. Digite exatamente: {expected}")
+    print_state(
+        daemon_request(
+            "POST",
+            "/testnet/smoke",
+            payload={"budget_usdc": budget_usdc, "confirmation": confirm},
+            timeout=120.0,
+        )
+    )
+
+
+@testnet_app.command("reconcile")
+def testnet_reconcile() -> None:
+    """Reconcilia estado persistido com snapshots do testnet."""
+    print_state(daemon_request("POST", "/testnet/reconcile", timeout=30.0))
+
+
+@release_app.command("build")
+def release_build() -> None:
+    """Constrói no daemon um manifesto de release imutável e não aprovado."""
+    print_state(daemon_request("POST", "/release/build", timeout=30.0))
+
+
+@release_app.command("verify")
+def release_verify(release_id: str) -> None:
+    """Recalcula hashes e vínculos de uma release sem habilitar mainnet."""
+    print_state(
+        daemon_request(
+            "POST",
+            "/release/verify",
+            payload={"release_id": release_id},
+            timeout=30.0,
+        )
+    )
+
+
+@release_app.command("approve")
+def release_approve(
+    release_id: str,
+    confirm: str = typer.Option(..., prompt=True),
+) -> None:
+    """Aprova manualmente uma release verificada; não inicia mainnet."""
+    expected = f"APPROVE RELEASE {release_id}"
+    if confirm != expected:
+        fail(f"Confirmação inválida. Digite exatamente: {expected}")
+    print_state(
+        daemon_request(
+            "POST",
+            "/release/approve",
+            payload={"release_id": release_id, "confirmation": confirm},
+            timeout=30.0,
+        )
+    )

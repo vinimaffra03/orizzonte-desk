@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import os
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -32,6 +34,14 @@ DATA_COLUMNS = (
     "volume",
     "funding_rate",
 )
+DatasetRole = Literal["development", "external_holdout"]
+DATASET_SCHEMA_VERSION = 2
+
+
+def stable_fingerprint(value: Any) -> str:
+    """Return a deterministic SHA-256 for JSON-compatible research inputs."""
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":"), default=str).encode()
+    return hashlib.sha256(payload).hexdigest()
 
 
 class DatasetManifest(BaseModel):
@@ -48,6 +58,13 @@ class DatasetManifest(BaseModel):
     path: str
     created_at: datetime
     parameters: dict[str, Any]
+    role: DatasetRole = "development"
+    schema_version: int = DATASET_SCHEMA_VERSION
+    config_fingerprint: str = ""
+    interval_seconds: int = 3600
+    expected_rows: int = 0
+    missing_rows: int = 0
+    immutable: bool = True
 
 
 def sha256_file(path: Path) -> str:
@@ -83,17 +100,29 @@ class DatasetManager:
         *,
         source: str,
         parameters: dict[str, Any],
+        role: DatasetRole = "development",
     ) -> DatasetManifest:
         self.paths.assert_free_space(self.settings.app.minimum_free_gb)
         validated = self.validate_frame(frame)
-        dataset_id = (
-            f"{source}-{validated['timestamp'].min():%Y%m%d}-{validated['timestamp'].max():%Y%m%d}"
-        )
-        output = self.paths.processed_data / f"{dataset_id}.parquet"
+        config_fingerprint = stable_fingerprint(self.settings.model_dump(mode="json"))
+        provisional = self.paths.processed_data / f".{source}-{os.getpid()}.parquet.tmp"
         arrow_frame = validated.copy()
         arrow_frame["timestamp"] = arrow_frame["timestamp"].dt.tz_convert("UTC")
-        pl.from_pandas(arrow_frame).write_parquet(output, compression="zstd", statistics=True)
-        digest = sha256_file(output)
+        pl.from_pandas(arrow_frame).write_parquet(provisional, compression="zstd", statistics=True)
+        digest = sha256_file(provisional)
+        dataset_id = (
+            f"{source}-{validated['timestamp'].min():%Y%m%d}-"
+            f"{validated['timestamp'].max():%Y%m%d}-{digest[:12]}"
+        )
+        output = self.paths.processed_data / f"{dataset_id}.parquet"
+        if output.exists():
+            if sha256_file(output) != digest:
+                provisional.unlink(missing_ok=True)
+                raise RuntimeError("Colisão de dataset imutável detectada")
+            provisional.unlink(missing_ok=True)
+        else:
+            os.replace(provisional, output)
+        audit = self.audit_frame(validated)
         manifest = DatasetManifest(
             dataset_id=dataset_id,
             source=source,
@@ -106,9 +135,22 @@ class DatasetManager:
             path=str(output),
             created_at=datetime.now(UTC),
             parameters=parameters,
+            role=role,
+            config_fingerprint=config_fingerprint,
+            expected_rows=audit["expected_rows"],
+            missing_rows=audit["missing_rows"],
         )
         manifest_path = self.paths.manifests / f"{dataset_id}.json"
-        manifest_path.write_text(manifest.model_dump_json(indent=2), encoding="utf-8")
+        if manifest_path.exists():
+            existing = DatasetManifest.model_validate_json(
+                manifest_path.read_text(encoding="utf-8")
+            )
+            if existing.sha256 != manifest.sha256:
+                raise RuntimeError("Manifesto imutável já existe com outro conteúdo")
+            return existing
+        temporary_manifest = manifest_path.with_suffix(".json.tmp")
+        temporary_manifest.write_text(manifest.model_dump_json(indent=2), encoding="utf-8")
+        os.replace(temporary_manifest, manifest_path)
         return manifest
 
     def validate_frame(self, frame: pd.DataFrame) -> pd.DataFrame:
@@ -132,7 +174,50 @@ class DatasetManager:
         )
         if invalid_ohlc.any():
             raise ValueError("Dataset contém candles OHLC inválidos")
-        return result.sort_values(["timestamp", "symbol"]).reset_index(drop=True)
+        if set(result["interval"].astype(str).unique()) != {"1h"}:
+            raise ValueError("Dataset deve usar exclusivamente candles 1h")
+        if set(result["symbol"].unique()) != set(SYMBOLS):
+            raise ValueError(f"Dataset deve cobrir o universo completo: {SYMBOLS}")
+        if not result["timestamp"].eq(result["timestamp"].dt.floor("h")).all():
+            raise ValueError("Dataset contém timestamps fora da grade horária UTC")
+        if (result["volume"] < 0).any():
+            raise ValueError("Dataset contém volume negativo")
+        if not np.isfinite(result[numeric].to_numpy(dtype=float)).all():
+            raise ValueError("Dataset contém valores numéricos ausentes ou infinitos")
+        result = result.sort_values(["timestamp", "symbol"]).reset_index(drop=True)
+        audit = self.audit_frame(result)
+        if audit["missing_rows"]:
+            raise ValueError(
+                f"Dataset incompleto: {audit['missing_rows']} candles horários ausentes; "
+                f"amostra={audit['gap_examples']}"
+            )
+        return result
+
+    def audit_frame(self, frame: pd.DataFrame) -> dict[str, Any]:
+        """Audit the hourly grid without changing the input frame."""
+        if frame.empty:
+            raise ValueError("Dataset vazio")
+        timestamps = pd.to_datetime(frame["timestamp"], utc=True)
+        start, end = timestamps.min(), timestamps.max()
+        expected_index = pd.date_range(start=start, end=end, freq="1h", tz="UTC")
+        symbols = sorted(str(value) for value in frame["symbol"].unique())
+        gap_examples: list[str] = []
+        missing_count = 0
+        for symbol in symbols:
+            actual = pd.DatetimeIndex(timestamps[frame["symbol"].astype(str) == symbol].unique())
+            gaps = expected_index.difference(actual)
+            missing_count += len(gaps)
+            gap_examples.extend(f"{symbol}:{stamp.isoformat()}" for stamp in gaps[:10])
+        return {
+            "start": start.isoformat(),
+            "end": end.isoformat(),
+            "symbols": symbols,
+            "actual_rows": len(frame),
+            "expected_rows": int(len(expected_index) * len(symbols)),
+            "missing_rows": int(missing_count),
+            "gap_examples": gap_examples[:20],
+            "complete": missing_count == 0,
+        }
 
     def load(self, path_or_id: str | Path) -> pd.DataFrame:
         path = Path(path_or_id)
@@ -140,11 +225,44 @@ class DatasetManager:
             path = self.paths.processed_data / f"{path_or_id}.parquet"
         if not path.exists():
             raise FileNotFoundError(f"Dataset não encontrado: {path_or_id}")
-        return (
+        manifest_path = self.paths.manifests / f"{path.stem}.json"
+        manifest = (
+            DatasetManifest.model_validate_json(manifest_path.read_text(encoding="utf-8"))
+            if manifest_path.exists()
+            else None
+        )
+        if manifest is not None and sha256_file(path) != manifest.sha256:
+            raise RuntimeError(f"Checksum inválido para dataset imutável: {manifest.dataset_id}")
+        loaded = (
             pl.read_parquet(path)
             .to_pandas()
             .assign(timestamp=lambda data: pd.to_datetime(data["timestamp"], utc=True))
         )
+        if manifest is not None:
+            loaded.attrs.update(
+                {
+                    "dataset_id": manifest.dataset_id,
+                    "dataset_hash": manifest.sha256,
+                    "dataset_role": manifest.role,
+                    "config_fingerprint": manifest.config_fingerprint,
+                    "schema_version": manifest.schema_version,
+                }
+            )
+        return loaded
+
+    def audit_manifest(self, manifest: DatasetManifest) -> dict[str, Any]:
+        path = Path(manifest.path)
+        checksum = sha256_file(path) if path.exists() else ""
+        frame = self.load(path) if path.exists() and checksum == manifest.sha256 else None
+        grid = self.audit_frame(frame) if frame is not None else {}
+        return {
+            "dataset_id": manifest.dataset_id,
+            "role": manifest.role,
+            "checksum_valid": checksum == manifest.sha256,
+            "config_fingerprint_valid": len(manifest.config_fingerprint) == 64,
+            "schema_version": manifest.schema_version,
+            **grid,
+        }
 
     def list_manifests(self) -> list[DatasetManifest]:
         manifests: list[DatasetManifest] = []
@@ -212,6 +330,7 @@ class DatasetManager:
             frame,
             source="binance-usdm",
             parameters={"start": start_ts.isoformat(), "end": end_ts.isoformat(), "interval": "1h"},
+            role="development",
         )
 
     def _binance_funding(self, start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
@@ -303,6 +422,7 @@ class DatasetManager:
             frame,
             source=f"hyperliquid-{environment}",
             parameters={"lookback_hours": lookback_hours, "interval": "1h"},
+            role="external_holdout",
         )
 
     def _hyperliquid_funding(
@@ -332,7 +452,9 @@ class DatasetManager:
                 for item in batch:
                     rows.append(
                         {
-                            "timestamp": pd.to_datetime(item["time"], unit="ms", utc=True),
+                            "timestamp": pd.to_datetime(item["time"], unit="ms", utc=True).floor(
+                                "h"
+                            ),
                             "symbol": symbol,
                             "funding_rate": float(item["fundingRate"]),
                         }
@@ -390,4 +512,5 @@ class DatasetManager:
             pd.concat(all_rows, ignore_index=True),
             source="synthetic",
             parameters={"hours": hours, "seed": seed},
+            role="development",
         )

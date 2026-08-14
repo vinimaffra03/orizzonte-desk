@@ -70,7 +70,10 @@ Treinar cria um candidato. Somente `promote` altera o modelo operacional, e apen
 
 ## Paper, testnet e mainnet
 
-O daemon executa o heartbeat, renova o dead man's switch e avalia cada novo candle:
+O daemon é o único escritor do estado operacional. CLI e TUI usam exclusivamente a API
+HTTP/WebSocket em `127.0.0.1` para consultar estado e executar controles; se o daemon estiver
+offline, os controles falham fechados. Ele executa o heartbeat, renova o dead man's switch e
+avalia cada novo candle:
 
 ```powershell
 uv run orizzonte daemon
@@ -90,7 +93,27 @@ uv run orizzonte secret set
 uv run orizzonte secret status
 ```
 
-Armar testnet ou mainnet exige digitar exatamente `ORIZZONTE LIVE <AMBIENTE> <ORÇAMENTO>`; por exemplo:
+Antes de considerar uma liberação, construa e verifique o pacote imutável, faça o preflight e
+execute manualmente o smoke test no **testnet**:
+
+```powershell
+uv run orizzonte release build
+uv run orizzonte release verify release-<id>
+uv run orizzonte release approve release-<id> # exige APPROVE RELEASE release-<id>
+uv run orizzonte testnet preflight
+uv run orizzonte testnet smoke --budget-usdc 25 # exige TESTNET SMOKE 25.00
+uv run orizzonte testnet reconcile
+```
+
+O fluxo quantitativo não atribui ao modelo final métricas que vieram dos modelos de cada fold.
+O histórico longo gera um gate de **protocolo walk-forward**; o holdout Hyperliquid recente exige
+`backtest run <dataset> --model-id <candidato>`. `backtest compare` só aprova quando protocolo e
+candidato compartilham configuração, código e commit, e vincula ambos os datasets ao hash exato
+do modelo que poderá ser promovido.
+
+O smoke test deve validar entrada, fill, proteções, restart/reconciliação e flatten usando
+saldo de testnet. Ele é deliberadamente manual e nunca troca silenciosamente para mainnet.
+Armar testnet exige digitar exatamente `ORIZZONTE LIVE <AMBIENTE> <ORÇAMENTO>`; por exemplo:
 
 ```powershell
 uv run orizzonte live arm --environment testnet --budget-usdc 1000
@@ -101,6 +124,12 @@ uv run orizzonte live disarm
 ```
 
 O agente recusa armar se encontrar posições ou ordens preexistentes na conta.
+Esta entrega é **mainnet-ready sem operar dinheiro real**: aprovar uma release não inicia o
+agente, e nenhuma ordem mainnet faz parte do aceite. A autorização operacional de mainnet é uma
+decisão futura, separada e explicitamente confirmada pelo operador.
+
+Siga a [checklist completa de release](docs/RELEASE_CHECKLIST.md) para congelamento dos dados,
+gates, testnet e verificação dos hashes.
 
 ## CLI
 
@@ -112,6 +141,8 @@ orizzonte backtest run | stress | compare
 orizzonte report latest | open | export
 orizzonte paper start | pause | stop
 orizzonte live arm | start | pause | resume | flatten | disarm
+orizzonte testnet preflight | smoke | reconcile
+orizzonte release build | verify | approve
 orizzonte status | positions | orders | risk | logs
 ```
 
@@ -136,12 +167,16 @@ uv run pytest
 uv run pip-audit
 ```
 
-O build Docker é verificado no GitHub Actions. O container é preparado para pesquisa/paper e implantação futura, mas a versão inicial roda localmente. O cofre DPAPI é específico do Windows; antes de habilitar live em Linux será necessário conectar um gerenciador de segredos externo, sem copiar uma chave privada em texto puro para a imagem.
+O build Docker é verificado no GitHub Actions. O container é preparado somente para
+pesquisa/paper e implantação futura; **live em Linux permanece bloqueado**. O cofre DPAPI é
+específico do Windows e, antes de qualquer live em Linux, será necessário conectar e auditar um
+gerenciador de segredos externo, sem copiar uma chave privada em texto puro para a imagem.
 
 ## Limitações conhecidas
 
 - O snapshot de candles da Hyperliquid contém no máximo 5.000 candles; por isso a pesquisa mantém um teste longo multi-venue e outro recente na venue.
 - Funding histórico da validação Hyperliquid deve ser coletado continuamente para elevar a fidelidade; o backtest aplica custos conservadores enquanto isso.
 - Nenhum resultado histórico elimina risco de regime, liquidez, slippage, falha de rede, ADL ou liquidação.
+- TradingView, Pine Script, webhooks e conectores TradingView ficam fora da v1; sinais e execução usam somente dados e APIs oficiais integrados ao daemon.
 
 Licenciado sob Apache-2.0.

@@ -25,9 +25,54 @@ jobs:
       - run: uv sync --frozen
       - run: uv run ruff format --check .
       - run: uv run ruff check .
-      - run: uv run mypy src
       - run: uv run pytest --cov-report=xml --cov-fail-under=65
       - run: uv run pip-audit
+
+  typecheck:
+    name: mypy (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.23"
+          enable-cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: uv sync --frozen
+      - run: uv run mypy src
+
+  contracts:
+    name: Contratos Hyperliquid sem secrets
+    runs-on: ubuntu-latest
+    env:
+      HYPERLIQUID_PRIVATE_KEY: ""
+      HYPERLIQUID_API_SECRET: ""
+      HYPERLIQUID_ACCOUNT_ADDRESS: ""
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.11.23"
+          enable-cache: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: uv sync --frozen
+      - name: Fixtures contratuais e fail-closed
+        run: >-
+          uv run pytest
+          tests/test_exchange.py
+          tests/test_exchange_contracts.py
+          tests/test_engine_daemon.py
+          tests/test_runtime_hardening.py
+          tests/test_release.py
+          tests/test_secrets.py
 
   secrets:
     runs-on: ubuntu-latest

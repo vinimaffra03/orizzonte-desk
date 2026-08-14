@@ -146,7 +146,7 @@ def _symbol_features(frame: pd.DataFrame, config: StrategyConfig) -> pd.DataFram
     base["label"] = (
         forward_return * base["signal_raw"] > np.maximum(base["atr_pct_1h"] * 1.5, 0.003)
     ).astype(float)
-    base.loc[base["signal_raw"] == 0, "label"] = np.nan
+    base.loc[(base["signal_raw"] == 0) | forward_return.isna(), "label"] = np.nan
     base["symbol"] = symbol
     return base.reset_index()
 
@@ -182,4 +182,6 @@ def prepare_features(frame: pd.DataFrame, config: StrategyConfig) -> pd.DataFram
     relations = pd.concat(relation_pieces, ignore_index=True)
     result = result.merge(relations, on=["timestamp", "symbol"], how="left")
     result.replace([np.inf, -np.inf], np.nan, inplace=True)
-    return result.sort_values(["timestamp", "symbol"]).reset_index(drop=True)
+    result = result.sort_values(["timestamp", "symbol"]).reset_index(drop=True)
+    result.attrs.update(frame.attrs)
+    return result

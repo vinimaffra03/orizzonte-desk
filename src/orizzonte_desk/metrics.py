@@ -36,14 +36,39 @@ def monte_carlo_ruin_probability(
     seed: int = 42017,
     ruin_fraction: float = 0.5,
 ) -> float:
+    return monte_carlo_summary(
+        trade_returns,
+        samples=samples,
+        seed=seed,
+        ruin_fraction=ruin_fraction,
+    )["ruin_probability_50"]
+
+
+def monte_carlo_summary(
+    trade_returns: np.ndarray,
+    *,
+    samples: int = 2000,
+    seed: int = 42017,
+    ruin_fraction: float = 0.5,
+) -> dict[str, float]:
+    """Moving-block bootstrap preserving short runs of trade dependence."""
     values = np.asarray(trade_returns, dtype=float)
     values = values[np.isfinite(values)]
     if values.size == 0:
-        return 1.0
+        return {
+            "ruin_probability_50": 1.0,
+            "mc_final_return_p05": -1.0,
+            "mc_final_return_p50": -1.0,
+            "mc_final_return_p95": -1.0,
+            "mc_max_drawdown_p50": 1.0,
+            "mc_max_drawdown_p95": 1.0,
+        }
     rng = np.random.default_rng(seed)
     block = max(1, min(10, values.size // 10))
     ruined = 0
-    for _ in range(samples):
+    final_returns = np.empty(samples)
+    maximum_drawdowns = np.empty(samples)
+    for sample_index in range(samples):
         sampled: list[float] = []
         while len(sampled) < values.size:
             start = int(rng.integers(0, max(1, values.size - block + 1)))
@@ -51,7 +76,18 @@ def monte_carlo_ruin_probability(
         curve = np.cumprod(1 + np.clip(sampled[: values.size], -0.99, 10))
         if curve.min(initial=1.0) <= 1 - ruin_fraction:
             ruined += 1
-    return ruined / samples
+        final_returns[sample_index] = curve[-1] - 1
+        peaks = np.maximum.accumulate(np.r_[1.0, curve])
+        path = np.r_[1.0, curve]
+        maximum_drawdowns[sample_index] = abs(float(np.min(path / peaks - 1)))
+    return {
+        "ruin_probability_50": ruined / samples,
+        "mc_final_return_p05": float(np.quantile(final_returns, 0.05)),
+        "mc_final_return_p50": float(np.quantile(final_returns, 0.50)),
+        "mc_final_return_p95": float(np.quantile(final_returns, 0.95)),
+        "mc_max_drawdown_p50": float(np.quantile(maximum_drawdowns, 0.50)),
+        "mc_max_drawdown_p95": float(np.quantile(maximum_drawdowns, 0.95)),
+    }
 
 
 @dataclass(slots=True)
@@ -120,10 +156,20 @@ def calculate_metrics(
         gross_profit / gross_loss if gross_loss > 0 else 999.0 if gross_profit > 0 else 0.0
     )
     trade_returns = trade_frame["net_pnl"].to_numpy(dtype=float) / initial_capital
-    ruin_probability = monte_carlo_ruin_probability(
+    monte_carlo = monte_carlo_summary(
         trade_returns,
         samples=monte_carlo_samples,
         seed=seed,
+    )
+    entry_notional = (
+        trade_frame["entry_price"].astype(float) * trade_frame["size"].astype(float)
+        if "entry_price" in trade_frame
+        else pd.Series(dtype=float)
+    )
+    exit_notional = (
+        trade_frame["exit_price"].astype(float) * trade_frame["size"].astype(float)
+        if "exit_price" in trade_frame
+        else pd.Series(dtype=float)
     )
     summary = {
         "initial_capital": initial_capital,
@@ -148,8 +194,25 @@ def calculate_metrics(
         "slippage": float(trade_frame["slippage"].sum()),
         "mae_mean": float(trade_frame["mae"].mean()) if not trade_frame.empty else 0.0,
         "mfe_mean": float(trade_frame["mfe"].mean()) if not trade_frame.empty else 0.0,
+        "exposure_time": (
+            float((curve["open_positions"] > 0).mean()) if "open_positions" in curve else 0.0
+        ),
+        "turnover": float((entry_notional.sum() + exit_notional.sum()) / initial_capital),
+        "average_holding_hours": (
+            float(
+                (
+                    pd.to_datetime(trade_frame["closed_at"], utc=True)
+                    - pd.to_datetime(trade_frame["opened_at"], utc=True)
+                )
+                .dt.total_seconds()
+                .mean()
+                / 3600
+            )
+            if not trade_frame.empty and {"opened_at", "closed_at"} <= set(trade_frame)
+            else 0.0
+        ),
         "days_hit_1pct": float((daily_returns >= 0.01).mean()) if not daily_returns.empty else 0.0,
-        "ruin_probability_50": ruin_probability,
+        **monte_carlo,
     }
 
     def grouped(column: str) -> dict[str, dict[str, float]]:
@@ -170,6 +233,12 @@ def calculate_metrics(
                     if float(group_wins["net_pnl"].sum()) > 0
                     else 0.0
                 ),
+                "expectancy": float(group["net_pnl"].mean()),
+                "fees": float(group["fees"].sum()),
+                "funding": float(group["funding"].sum()),
+                "slippage": float(group["slippage"].sum()),
+                "mae_mean": float(group["mae"].mean()),
+                "mfe_mean": float(group["mfe"].mean()),
             }
         return output
 
