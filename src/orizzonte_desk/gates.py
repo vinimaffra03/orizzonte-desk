@@ -92,13 +92,37 @@ def load_combined_gate(paths: list[Path]) -> dict[str, Any]:
             for payload, binding in candidate_pairs
         )
     )
+    candidate_policy_bindings = {
+        (
+            str(binding["decision_policy_id"]),
+            str(binding["decision_policy_hash"]),
+        )
+        for _, binding in candidate_pairs
+        if binding.get("decision_policy_id") and binding.get("decision_policy_hash")
+    }
+    decision_policy_binding_valid = (
+        bool(candidate_pairs)
+        and len(candidate_policy_bindings) == 1
+        and all(
+            binding.get("decision_policy_id") and binding.get("decision_policy_hash")
+            for _, binding in candidate_pairs
+        )
+    )
+    candidate_policy_id, candidate_policy_hash = (
+        next(iter(candidate_policy_bindings)) if decision_policy_binding_valid else (None, None)
+    )
     protocol_binding_valid = bool(protocol_pairs) and all(
         binding.get("protocol_hash")
         and not binding.get("model_hash")
         and not payload.get("model_hash")
         for payload, binding in protocol_pairs
     )
-    bindings_match = shared_invariants_match and model_binding_valid and protocol_binding_valid
+    bindings_match = (
+        shared_invariants_match
+        and model_binding_valid
+        and decision_policy_binding_valid
+        and protocol_binding_valid
+    )
     protocol_hashes = sorted({str(binding["protocol_hash"]) for _, binding in protocol_pairs})
     return {
         "passed": (
@@ -112,6 +136,8 @@ def load_combined_gate(paths: list[Path]) -> dict[str, Any]:
         "release_binding": {
             **({key: bindings[0].get(key) for key in shared_keys} if bindings else {}),
             "model_hash": candidate_model_hash,
+            "decision_policy_id": candidate_policy_id,
+            "decision_policy_hash": candidate_policy_hash,
             "evaluation_scope": "combined_release",
             "protocol_hashes": protocol_hashes,
             "dataset_hashes": sorted(

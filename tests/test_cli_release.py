@@ -128,6 +128,106 @@ def test_new_command_groups_are_documented_by_help(runner: CliRunner) -> None:
     assert result.exit_code == 0
     assert "testnet" in result.stdout
     assert "release" in result.stdout
+    assert "mainnet" in result.stdout
+    assert "ops" in result.stdout
+
+
+@pytest.mark.parametrize(
+    ("group", "commands"),
+    [
+        ("research", ("diagnose", "regimes")),
+        ("secret", ("generate", "verify", "rotate", "status")),
+        ("mainnet", ("authorize", "status", "revoke")),
+        ("ops", ("install", "status", "backup", "restore-dry-run", "uninstall")),
+    ],
+)
+def test_v2_command_contract_is_visible(
+    runner: CliRunner, group: str, commands: tuple[str, ...]
+) -> None:
+    result = runner.invoke(cli_module.app, [group, "--help"])
+
+    assert result.exit_code == 0
+    rendered = unstyle(result.stdout)
+    for command in commands:
+        assert command in rendered
+
+
+def test_secret_generate_never_accepts_or_returns_plaintext_key(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[str, str, dict[str, Any] | None]] = []
+
+    def fake_request(
+        method: str,
+        endpoint: str,
+        *,
+        payload: dict[str, Any] | None = None,
+        timeout: float = 10.0,
+    ) -> dict[str, Any]:
+        calls.append((method, endpoint, payload))
+        return {
+            "environment": "testnet",
+            "configured": True,
+            "wallet_address": "0x" + "2" * 40,
+        }
+
+    monkeypatch.setattr(cli_module, "daemon_request", fake_request)
+    account = "0x" + "1" * 40
+    result = runner.invoke(
+        cli_module.app,
+        ["secret", "generate", "--environment", "testnet", "--account-address", account],
+    )
+
+    assert result.exit_code == 0
+    assert calls == [
+        (
+            "POST",
+            "/internal/secrets/testnet/generate",
+            {"account_address": account},
+        )
+    ]
+    assert "secret_key" not in result.stdout
+
+
+def test_mainnet_authorize_only_requests_capability(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[tuple[str, str, dict[str, Any] | None]] = []
+
+    def fake_request(
+        method: str,
+        endpoint: str,
+        *,
+        payload: dict[str, Any] | None = None,
+        timeout: float = 10.0,
+    ) -> dict[str, Any]:
+        calls.append((method, endpoint, payload))
+        assert timeout == 30.0
+        return {"authorization_id": "a" * 32, "available": True}
+
+    monkeypatch.setattr(cli_module, "daemon_request", fake_request)
+    confirmation = f"AUTHORIZE MAINNET release-abc 0x{'1' * 40} 500.00"
+    result = runner.invoke(
+        cli_module.app,
+        [
+            "mainnet",
+            "authorize",
+            "--budget-usdc",
+            "500",
+            "--confirm",
+            confirmation,
+        ],
+    )
+
+    assert result.exit_code == 0
+    assert calls == [
+        (
+            "POST",
+            "/internal/mainnet/authorize",
+            {"budget_usdc": 500.0, "confirmation": confirmation},
+        )
+    ]
+    assert "/control/arm" not in str(calls)
 
 
 def test_unsupported_daemon_capability_fails_closed(

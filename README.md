@@ -14,9 +14,11 @@ O núcleo combina setups determinísticos multi-timeframe com um meta-modelo Lig
 - Até duas posições simultâneas, com bloqueio de altcoins correlacionadas.
 - Profit lock em +1% UTC, stop diário em −4% e kill switch em −25% desde o high-water mark.
 - SL/TP reduce-only instalados na exchange; falha de proteção fecha a posição.
-- API wallet exclusiva protegida por DPAPI. A chave principal não deve ser usada.
+- API wallets exclusivas e separadas para testnet/mainnet, protegidas por DPAPI. A chave
+  principal não deve ser usada e fingerprints rotacionadas não podem ser reutilizadas.
 - O adaptador não implementa saque ou transferência.
-- Mainnet exige modelo promovido, dois gates aprovados, conta vazia e confirmação textual forte.
+- Mainnet exige modelo promovido, dois gates aprovados, release aprovada, certificado
+  testnet e capability DPAPI de uso único com TTL de 15 minutos e teto de 500 USDC.
 
 ## Instalação no disco D:
 
@@ -62,11 +64,20 @@ Um gate aprovado exige Sharpe ≥ 1,0, profit factor ≥ 1,15, drawdown ≤ 25%,
 
 ```powershell
 uv run orizzonte research train
+uv run orizzonte research diagnose --dataset-id <dataset-development>
+uv run orizzonte research regimes --dataset-id <dataset-development>
 uv run orizzonte research evaluate
 uv run orizzonte research promote model-AAAAMMDDTHHMMSSZ --gate 'D:\orizzonte desk\reports\<run>\gate.json'
 ```
 
-Treinar cria um candidato. Somente `promote` altera o modelo operacional, e apenas com gate aprovado.
+Treinar cria um candidato e uma `DecisionPolicy` content-addressed. O threshold é escolhido
+por split temporal nested, purge de 24 horas, custos 2× e block bootstrap; sem limite inferior
+positivo, o modelo fica `no-trade` e não pode ser promovido. Somente `promote` altera o modelo
+operacional, e apenas com gate aprovado. Baselines sem ML são diagnósticos e nunca geram gate.
+
+O estudo de regimes é sempre *challenger*. Ele compara pooled, mapeamento estático e seletor
+semanal em walk-forward event-driven, mas não pode substituir a v2 no mesmo ciclo nem olhar o
+holdout Hyperliquid.
 
 ## Paper, testnet e mainnet
 
@@ -89,8 +100,9 @@ uv run orizzonte paper start --budget-usdc 10000
 Configure uma **API wallet nova e exclusiva** autorizada na Hyperliquid. Informe o endereço da conta principal, não o endereço da API wallet:
 
 ```powershell
-uv run orizzonte secret set
-uv run orizzonte secret status
+uv run orizzonte secret generate --environment testnet
+uv run orizzonte secret verify --environment testnet
+uv run orizzonte secret status --environment testnet
 ```
 
 Antes de considerar uma liberação, construa e verifique o pacote imutável, faça o preflight e
@@ -103,6 +115,7 @@ uv run orizzonte release approve release-<id> # exige APPROVE RELEASE release-<i
 uv run orizzonte testnet preflight
 uv run orizzonte testnet smoke --budget-usdc 25 # exige TESTNET SMOKE 25.00
 uv run orizzonte testnet reconcile
+uv run orizzonte testnet certificate
 ```
 
 O fluxo quantitativo não atribui ao modelo final métricas que vieram dos modelos de cada fold.
@@ -123,26 +136,55 @@ uv run orizzonte live flatten   # exige FLATTEN
 uv run orizzonte live disarm
 ```
 
-O agente recusa armar se encontrar posições ou ordens preexistentes na conta.
-Esta entrega é **mainnet-ready sem operar dinheiro real**: aprovar uma release não inicia o
-agente, e nenhuma ordem mainnet faz parte do aceite. A autorização operacional de mainnet é uma
-decisão futura, separada e explicitamente confirmada pelo operador.
+O agente recusa armar se encontrar posições ou ordens preexistentes na conta. Mainnet continua
+travada até uma autorização separada, vinculada a release, commit, configuração, modelo, gates,
+certificado, conta, API wallet e orçamento:
 
-Siga a [checklist completa de release](docs/RELEASE_CHECKLIST.md) para congelamento dos dados,
-gates, testnet e verificação dos hashes.
+```powershell
+uv run orizzonte secret generate --environment mainnet
+uv run orizzonte mainnet status
+uv run orizzonte mainnet authorize --budget-usdc 500
+# exige: AUTHORIZE MAINNET <release> <conta-lowercase> 500.00
+uv run orizzonte live arm --environment mainnet --budget-usdc 500
+```
+
+Autorizar não arma nem envia ordem. `live arm` consome a capability atomicamente. Restart ou
+pause exige uma nova autorização para entradas/resume, enquanto a gestão de posições e proteções
+continua em `PAUSED`/`LOCKED`. Nesta entrega nenhum segredo/capability real é criado e nenhuma
+ordem mainnet faz parte do aceite.
+
+Para operação local no Windows:
+
+```powershell
+uv run orizzonte ops install       # exige INSTALL ORIZZONTE TASKS
+uv run orizzonte ops status
+uv run orizzonte ops backup
+uv run orizzonte ops restore-dry-run <backup-id>
+uv run orizzonte ops uninstall     # exige REMOVE ORIZZONTE TASKS
+```
+
+Os logs rotacionam no disco D:, o watchdog aplica lock fail-closed e os 30 backups mais recentes
+são mantidos localmente. A instalação do daemon nunca autoriza retomar entradas após restart.
+
+Siga a [checklist completa de release](docs/RELEASE_CHECKLIST.md) e o
+[protocolo v2](docs/V2_PROTOCOL.md) para congelamento dos dados, gates, estudo challenger,
+testnet e verificação dos hashes.
 
 ## CLI
 
 ```text
 orizzonte init | doctor | daemon | tui
 orizzonte data sync | validate | status
-orizzonte research train | evaluate | promote
+orizzonte research train | evaluate | diagnose | regimes | promote
 orizzonte backtest run | stress | compare
 orizzonte report latest | open | export
 orizzonte paper start | pause | stop
 orizzonte live arm | start | pause | resume | flatten | disarm
-orizzonte testnet preflight | smoke | reconcile
+orizzonte secret generate | verify | rotate | status
+orizzonte testnet preflight | smoke | reconcile | certificate
 orizzonte release build | verify | approve
+orizzonte mainnet authorize | status | revoke
+orizzonte ops install | status | backup | restore-dry-run | uninstall
 orizzonte status | positions | orders | risk | logs
 ```
 

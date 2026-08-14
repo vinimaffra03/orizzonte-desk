@@ -17,17 +17,32 @@ from lightgbm import LGBMClassifier
 from sklearn.calibration import CalibratedClassifierCV
 from sklearn.metrics import brier_score_loss, roc_auc_score
 
+from orizzonte_desk.config import (
+    AppConfig,
+    BacktestConfig,
+    ExecutionConfig,
+    ResearchConfig,
+    RiskConfig,
+    Settings,
+    StrategyConfig,
+    UniverseConfig,
+)
+from orizzonte_desk.constants import SYMBOLS
+from orizzonte_desk.decision import DecisionPolicy, DecisionPolicySelector, ThresholdEvaluator
 from orizzonte_desk.features import FEATURE_COLUMNS
 from orizzonte_desk.paths import AppPaths
 
 RESEARCH_CODE_FILES = (
     "data.py",
+    "decision.py",
     "features.py",
     "strategy.py",
     "ml.py",
     "backtest.py",
     "metrics.py",
     "gates.py",
+    "regimes.py",
+    "risk.py",
 )
 
 
@@ -132,12 +147,108 @@ class TrainingResult:
     metadata_path: Path
     metrics: dict[str, float]
     model_hash: str
+    decision_policy_id: str
+    decision_policy_path: Path
 
 
 class MetaModelRegistry:
-    def __init__(self, paths: AppPaths) -> None:
+    def __init__(
+        self,
+        paths: AppPaths,
+        research: ResearchConfig | None = None,
+        execution: ExecutionConfig | None = None,
+        *,
+        settings: Settings | None = None,
+    ) -> None:
         self.paths = paths
+        self.research = research or ResearchConfig()
+        self.execution = execution or ExecutionConfig()
+        if settings is not None:
+            self.settings = settings
+        elif self.paths.config.exists():
+            self.settings = Settings.load(self.paths.config)
+        else:
+            self.settings = Settings(
+                app=AppConfig(),
+                universe=UniverseConfig(),
+                risk=RiskConfig(),
+                strategy=StrategyConfig(),
+                execution=self.execution,
+                backtest=BacktestConfig(),
+                research=self.research,
+            )
         self.paths.models.mkdir(parents=True, exist_ok=True)
+
+    def _event_threshold_evaluator(
+        self,
+        full_frame: pd.DataFrame,
+        *,
+        seed: int,
+        dataset_hash: str,
+    ) -> ThresholdEvaluator:
+        """Return an event-driven net-R objective for nested threshold selection."""
+        from orizzonte_desk.backtest import EventBacktester
+
+        initial_risk = self.settings.backtest.initial_capital * self.settings.risk.risk_per_trade
+        ordered = full_frame.copy()
+        ordered["timestamp"] = pd.to_datetime(ordered["timestamp"], utc=True)
+        closes = ordered.pivot(index="timestamp", columns="symbol", values="close").sort_index()
+        returns = closes.apply(np.log).diff()
+        correlations: dict[pd.Timestamp, dict[tuple[str, str], float]] = {}
+        for left_index, left in enumerate(SYMBOLS):
+            for right in SYMBOLS[left_index + 1 :]:
+                if left not in returns or right not in returns:
+                    continue
+                causal = returns[left].rolling(719, min_periods=167).corr(returns[right]).shift(1)
+                for timestamp, value in causal.dropna().items():
+                    if np.isfinite(value):
+                        correlations.setdefault(pd.Timestamp(cast(Any, timestamp)), {})[
+                            (left, right)
+                        ] = float(value)
+
+        def evaluate(threshold: float, validation: pd.DataFrame) -> np.ndarray:
+            validation = validation.loc[:, ["timestamp", "symbol", "probability"]].copy()
+            validation["timestamp"] = pd.to_datetime(validation["timestamp"], utc=True)
+            validation_start = pd.Timestamp(validation["timestamp"].min())
+            validation_end = pd.Timestamp(validation["timestamp"].max())
+            warmup_start = validation_start - pd.Timedelta(days=30)
+            enriched = full_frame.copy()
+            enriched["timestamp"] = pd.to_datetime(enriched["timestamp"], utc=True)
+            enriched = enriched[
+                (enriched["timestamp"] >= warmup_start) & (enriched["timestamp"] <= validation_end)
+            ].copy()
+            enriched.drop(columns=["probability"], inplace=True, errors="ignore")
+            enriched = enriched.merge(
+                validation,
+                on=["timestamp", "symbol"],
+                how="left",
+                validate="one_to_one",
+            )
+            enriched["ml_probability"] = enriched["probability"].fillna(0.0)
+            enriched["decision_threshold"] = threshold
+            enriched["decision_policy_id"] = "nested-selection"
+            enriched["decision_accepted"] = enriched["probability"].ge(threshold).fillna(False)
+            enriched["signal"] = enriched["signal_raw"].where(enriched["decision_accepted"], 0)
+            enriched.drop(columns=["probability"], inplace=True)
+            enriched.attrs.update(full_frame.attrs)
+            result = EventBacktester(self.settings, self.paths).run(
+                enriched,
+                source=f"decision-inner-q-{threshold:.12f}",
+                dataset_hash=dataset_hash,
+                cost_multiplier=2.0,
+                seed=seed,
+                persist=False,
+                enriched_override=enriched,
+                run_stress_suite=False,
+                metrics_monte_carlo_samples=100,
+                correlations_override=correlations,
+                objective_trades_only=True,
+            )
+            return np.asarray(
+                [trade.net_pnl / initial_risk for trade in result.trades], dtype=float
+            )
+
+        return evaluate
 
     @property
     def promoted_pointer(self) -> Path:
@@ -159,11 +270,36 @@ class MetaModelRegistry:
             raise ValueError("Dataset external_holdout é proibido para treino ou calibração")
         if role != "development":
             raise ValueError(f"Papel de dataset desconhecido: {role}")
-        candidates = frame.loc[frame["signal_raw"] != 0].dropna(subset=[*FEATURE_COLUMNS, "label"])
-        if len(candidates) < 200:
-            raise ValueError(f"Amostra insuficiente para ML: {len(candidates)} sinais; mínimo 200")
+        candidates = frame.loc[frame["signal_raw"] != 0].dropna(
+            subset=[*FEATURE_COLUMNS, "label", "realized_r_24h"]
+        )
+        minimum_candidates = max(
+            200,
+            int(
+                np.ceil(
+                    self.research.threshold_min_validation_trades
+                    / self.research.inner_validation_fraction
+                    / (1 - self.research.inner_validation_fraction)
+                    / min(self.research.threshold_quantiles)
+                )
+            ),
+        )
+        if len(candidates) < minimum_candidates:
+            raise ValueError(
+                f"Amostra insuficiente para ML/DecisionPolicy: {len(candidates)} sinais; "
+                f"mínimo {minimum_candidates}"
+            )
         candidates = candidates.sort_values(["timestamp", "symbol"])
-        train, test = timestamp_holdout_split(candidates)
+        development, test = timestamp_holdout_split(
+            candidates,
+            test_fraction=self.research.inner_validation_fraction,
+            purge_hours=self.research.purge_hours,
+        )
+        train, _ = timestamp_holdout_split(
+            development,
+            test_fraction=self.research.inner_validation_fraction,
+            purge_hours=self.research.purge_hours,
+        )
         estimator = LGBMClassifier(
             n_estimators=250,
             learning_rate=0.035,
@@ -191,9 +327,26 @@ class MetaModelRegistry:
             else 0.5,
             "brier_score": float(brier_score_loss(test["label"], probabilities)),
             "training_samples": float(len(train)),
+            "development_samples": float(len(development)),
             "test_samples": float(len(test)),
             "positive_rate": float(candidates["label"].mean()),
         }
+        calibration_method = "sigmoid_temporal_purged_3fold"
+        calibration_hash = hashlib.sha256(
+            json.dumps(
+                {
+                    "method": calibration_method,
+                    "roc_auc": metrics["roc_auc"],
+                    "brier_score": metrics["brier_score"],
+                    "training_start": pd.Timestamp(train["timestamp"].min()).isoformat(),
+                    "training_end": pd.Timestamp(train["timestamp"].max()).isoformat(),
+                    "training_samples": len(train),
+                    "features": list(FEATURE_COLUMNS),
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
         resolved_dataset_hashes = dataset_hashes or tuple(
             value for value in (str(frame.attrs.get("dataset_hash", "")),) if value
         )
@@ -229,6 +382,78 @@ class MetaModelRegistry:
                 provisional_model.replace(model_path)
         finally:
             provisional_model.unlink(missing_ok=True)
+        development_probabilities = calibrated.predict_proba(development.loc[:, FEATURE_COLUMNS])[
+            :, 1
+        ]
+        decision_frame = development.loc[
+            :, ["timestamp", "symbol", "realized_r_24h", "stop_distance", "close"]
+        ].rename(columns={"realized_r_24h": "realized_return"})
+        decision_frame["probability"] = development_probabilities
+        selector = DecisionPolicySelector(
+            validation_fraction=self.research.inner_validation_fraction,
+            purge_hours=self.research.purge_hours,
+            quantiles=self.research.threshold_quantiles,
+            min_validation_trades=self.research.threshold_min_validation_trades,
+            bootstrap_samples=self.research.threshold_bootstrap_samples,
+            lcb_quantile=self.research.threshold_lcb_quantile,
+            seed=seed,
+        )
+        round_trip_cost = 2 * (
+            self.execution.taker_fee + self.execution.slippage_bps_sol_xrp / 10_000
+        )
+        decision_frame["cost_r"] = round_trip_cost / (
+            decision_frame["stop_distance"] / decision_frame["close"]
+        )
+        selection = selector.select(
+            decision_frame,
+            model_hash=digest,
+            round_trip_cost=round_trip_cost,
+            evaluator=self._event_threshold_evaluator(
+                frame,
+                seed=seed,
+                dataset_hash=(resolved_dataset_hashes[0] if resolved_dataset_hashes else ""),
+            ),
+            calibration_method=calibration_method,
+            calibration_hash=calibration_hash,
+            release_binding=release_binding,
+        )
+        decision_dir = self.paths.models / "decision-policies"
+        decision_artifacts = selection.write(decision_dir)
+        decision_policy_hash = file_hash(decision_artifacts["decision_policy"])
+        release_binding.update(
+            {
+                "decision_policy_id": selection.policy.policy_id,
+                "decision_policy_hash": decision_policy_hash,
+            }
+        )
+        final_decisions = test.loc[
+            :, ["timestamp", "symbol", "realized_return_24h", "realized_r_24h"]
+        ].copy()
+        final_decisions["probability"] = probabilities
+        final_decisions["accepted"] = selection.policy.apply(probabilities)
+        final_decisions["stage"] = "outer_holdout"
+        final_csv = decision_dir / f"{selection.policy.policy_id}-outer-holdout.csv"
+        final_parquet = decision_dir / f"{selection.policy.policy_id}-outer-holdout.parquet"
+        final_decisions.to_csv(final_csv, index=False)
+        final_decisions.to_parquet(final_parquet, compression="zstd", index=False)
+        complete_funnel = {
+            **selection.funnel,
+            "outer_candidates": len(candidates),
+            "outer_development": len(development),
+            "outer_holdout": len(test),
+            "outer_holdout_accepted": int(final_decisions["accepted"].sum()),
+        }
+        funnel_path = decision_dir / f"{selection.policy.policy_id}-complete-funnel.json"
+        funnel_path.write_text(json.dumps(complete_funnel, indent=2), encoding="utf-8")
+        metrics.update(
+            {
+                "decision_threshold": selection.policy.probability_threshold,
+                "decision_quantile": selection.policy.selected_quantile,
+                "decision_validation_trades": float(selection.policy.validation_trades),
+                "decision_lcb_p05": selection.policy.expectancy_lcb_p05,
+                "decision_outer_trades": float(final_decisions["accepted"].sum()),
+            }
+        )
         metadata = {
             "model_id": model_id,
             "model_path": str(model_path),
@@ -238,10 +463,27 @@ class MetaModelRegistry:
             "status": "candidate",
             "dataset_role": role,
             "release_binding": release_binding,
+            "decision_policy_id": selection.policy.policy_id,
+            "decision_policy_path": str(decision_artifacts["decision_policy"]),
+            "decision_policy_hash": decision_policy_hash,
+            "decision_artifacts": {
+                **{key: str(value) for key, value in decision_artifacts.items()},
+                "outer_holdout_csv": str(final_csv),
+                "outer_holdout_parquet": str(final_parquet),
+                "complete_funnel": str(funnel_path),
+            },
         }
         metadata_path = self.paths.models / f"{model_id}.json"
         metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
-        return TrainingResult(model_id, model_path, metadata_path, metrics, digest)
+        return TrainingResult(
+            model_id,
+            model_path,
+            metadata_path,
+            metrics,
+            digest,
+            selection.policy.policy_id,
+            decision_artifacts["decision_policy"],
+        )
 
     def promote(self, model_id: str, gate_path: Path) -> dict[str, Any]:
         metadata_path = self.paths.models / f"{model_id}.json"
@@ -255,6 +497,14 @@ class MetaModelRegistry:
         actual_hash = file_hash(model_path)
         if actual_hash != metadata.get("model_hash"):
             raise RuntimeError("Hash do modelo candidato não confere")
+        policy = self.load_decision_policy(model_id)
+        if (
+            policy is None
+            or not policy.trade_enabled
+            or policy.expectancy_lcb_p05 <= 0
+            or policy.validation_trades < self.research.threshold_min_validation_trades
+        ):
+            raise RuntimeError("Modelo sem DecisionPolicy elegível não pode ser promovido")
         gate_binding = gate.get("release_binding")
         expected_binding = {
             **metadata.get("release_binding", {}),
@@ -264,7 +514,13 @@ class MetaModelRegistry:
             raise RuntimeError("Gate não contém release_binding auditável")
         gate_model_hash = gate_binding.get("model_hash")
         top_level_model_matches = gate.get("model_hash", actual_hash) == actual_hash
-        invariant_keys = ("config_fingerprint", "code_hash", "commit_hash")
+        invariant_keys = (
+            "config_fingerprint",
+            "code_hash",
+            "commit_hash",
+            "decision_policy_id",
+            "decision_policy_hash",
+        )
         invariants_match = all(
             gate_binding.get(key) == expected_binding.get(key) for key in invariant_keys
         )
@@ -314,6 +570,24 @@ class MetaModelRegistry:
         if file_hash(model_path) != metadata.get("model_hash"):
             raise RuntimeError("Hash do modelo candidato não confere")
         return cast(dict[str, Any], joblib.load(model_path))
+
+    def load_decision_policy(self, model_id: str | None = None) -> DecisionPolicy | None:
+        metadata_path = (
+            self.paths.models / f"{model_id}.json" if model_id else self.promoted_pointer
+        )
+        if not metadata_path.exists():
+            return None
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        policy_path_value = metadata.get("decision_policy_path")
+        if not policy_path_value:
+            return None
+        policy_path = Path(str(policy_path_value))
+        if not policy_path.exists():
+            raise RuntimeError("DecisionPolicy vinculada ao modelo não foi encontrada")
+        expected_hash = metadata.get("decision_policy_hash")
+        if expected_hash and file_hash(policy_path) != expected_hash:
+            raise RuntimeError("Hash da DecisionPolicy não confere")
+        return DecisionPolicy.from_payload(json.loads(policy_path.read_text(encoding="utf-8")))
 
     def predict(self, frame: pd.DataFrame, bundle: dict[str, Any] | None = None) -> np.ndarray:
         loaded = bundle or self.load_promoted()

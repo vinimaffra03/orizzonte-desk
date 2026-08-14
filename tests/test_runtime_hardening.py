@@ -152,6 +152,7 @@ class _FilledGateway(_TimeoutAfterAcceptanceGateway):
                 "reduceOnly": True,
                 "size": size,
                 "kind": kind,
+                "side": "A" if signal.side is Side.LONG else "B",
             }
             for kind in ("sl", "tp")
         )

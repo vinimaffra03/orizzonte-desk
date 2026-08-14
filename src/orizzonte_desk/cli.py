@@ -5,9 +5,10 @@ import os
 import platform
 import shutil
 import sys
+from dataclasses import asdict, is_dataclass
 from enum import StrEnum
 from pathlib import Path
-from typing import Any, NoReturn
+from typing import Any, NoReturn, cast
 
 import httpx
 import pandas as pd
@@ -22,13 +23,18 @@ from orizzonte_desk.config import Settings
 from orizzonte_desk.constants import APP_NAME, LIVE_CONFIRMATION_PREFIX
 from orizzonte_desk.controller import AgentController
 from orizzonte_desk.daemon import create_app
-from orizzonte_desk.data import DatasetManager, DatasetManifest
+from orizzonte_desk.data import DatasetManager, DatasetManifest, stable_fingerprint
 from orizzonte_desk.gates import load_combined_gate
-from orizzonte_desk.ml import MetaModelRegistry
+from orizzonte_desk.ml import (
+    MetaModelRegistry,
+    git_commit_fingerprint,
+    research_code_fingerprint,
+)
 from orizzonte_desk.models import AgentStatus, Environment
+from orizzonte_desk.ops import OperationsError, OperationsManager
 from orizzonte_desk.paths import AppPaths
 from orizzonte_desk.reports import generate_report, open_report
-from orizzonte_desk.secrets import DPAPISecretStore
+from orizzonte_desk.secrets import EnvironmentSecretManager
 from orizzonte_desk.storage import StateStore
 from orizzonte_desk.strategy import SignalGenerator
 from orizzonte_desk.tui import run_tui
@@ -49,6 +55,8 @@ live_app = typer.Typer(help="Controle explícito de testnet/mainnet.")
 secret_app = typer.Typer(help="Cofre DPAPI local para a API wallet.")
 testnet_app = typer.Typer(help="Preflight, smoke e reconciliação controlados no testnet.")
 release_app = typer.Typer(help="Build, verificação e aprovação de releases imutáveis.")
+mainnet_app = typer.Typer(help="Capability local, efêmera e de uso único para mainnet.")
+ops_app = typer.Typer(help="Task Scheduler, watchdog e backups locais no disco D:.")
 app.add_typer(data_app, name="data")
 app.add_typer(research_app, name="research")
 app.add_typer(backtest_app, name="backtest")
@@ -58,6 +66,8 @@ app.add_typer(live_app, name="live")
 app.add_typer(secret_app, name="secret")
 app.add_typer(testnet_app, name="testnet")
 app.add_typer(release_app, name="release")
+app.add_typer(mainnet_app, name="mainnet")
+app.add_typer(ops_app, name="ops")
 
 
 class DataSource(StrEnum):
@@ -182,11 +192,17 @@ def doctor() -> None:
     checks.append(("Python 3.11", sys.version_info[:2] == (3, 11), platform.python_version()))
     checks.append(("Configuração", paths.config.exists(), str(paths.config)))
     checks.append(("SQLite WAL", paths.database.exists(), str(paths.database)))
+    wallets = EnvironmentSecretManager(paths.secrets)
+    configured_wallets = [
+        environment.value
+        for environment in (Environment.TESTNET, Environment.MAINNET)
+        if wallets.path_for(environment).exists()
+    ]
     checks.append(
         (
-            "Cofre DPAPI",
-            DPAPISecretStore(paths.secret_file).exists(),
-            "configurado" if paths.secret_file.exists() else "opcional até testnet/live",
+            "Cofres DPAPI separados",
+            bool(configured_wallets),
+            ", ".join(configured_wallets) if configured_wallets else "opcionais até testnet/live",
         )
     )
     checks.append(
@@ -210,7 +226,9 @@ def doctor() -> None:
         table.add_row(name, "[green]OK[/]" if passed else "[yellow]ATENÇÃO[/]", detail)
     console.print(table)
     if not all(
-        passed for name, passed, _ in checks if name not in {"Cofre DPAPI", "Modelo promovido"}
+        passed
+        for name, passed, _ in checks
+        if name not in {"Cofres DPAPI separados", "Modelo promovido"}
     ):
         raise typer.Exit(1)
 
@@ -284,27 +302,57 @@ def logs(limit: int = typer.Option(100, min=1, max=500)) -> None:
         )
 
 
-@secret_app.command("set")
-def secret_set(
+def require_wallet_environment(environment: Environment) -> None:
+    if environment is Environment.PAPER:
+        fail("Paper não possui API wallet; escolha testnet ou mainnet")
+
+
+@secret_app.command("generate")
+def secret_generate(
+    environment: Environment = typer.Option(..., "--environment"),
     account_address: str = typer.Option(..., prompt=True),
-    secret_key: str = typer.Option(..., prompt=True, hide_input=True),
 ) -> None:
-    paths, _, _, _ = context()
-    if not account_address.startswith("0x") or len(account_address) != 42:
-        fail("Endereço principal inválido")
-    if not secret_key.startswith("0x"):
-        fail("A chave privada da API wallet deve começar com 0x")
-    DPAPISecretStore(paths.secret_file).save(
-        {"account_address": account_address.lower(), "secret_key": secret_key}
+    """Gera localmente uma API wallet nova e salva somente o segredo DPAPI."""
+    require_wallet_environment(environment)
+    print_state(
+        daemon_request(
+            "POST",
+            f"/internal/secrets/{environment.value}/generate",
+            payload={"account_address": account_address},
+        )
     )
-    console.print("[green]Cofre DPAPI salvo no disco D:. A chave não será exibida.[/]")
+
+
+@secret_app.command("verify")
+def secret_verify(environment: Environment = typer.Option(..., "--environment")) -> None:
+    require_wallet_environment(environment)
+    print_state(daemon_request("POST", f"/internal/secrets/{environment.value}/verify"))
+
+
+@secret_app.command("rotate")
+def secret_rotate(
+    environment: Environment = typer.Option(..., "--environment"),
+    account_address: str = typer.Option(..., prompt=True),
+    confirm: str = typer.Option(..., prompt=True),
+) -> None:
+    """Rotaciona para uma chave gerada localmente e proíbe reutilizar fingerprints antigas."""
+    require_wallet_environment(environment)
+    expected = f"ROTATE {environment.value.upper()} API WALLET"
+    if confirm != expected:
+        fail(f"Confirmação inválida. Digite exatamente: {expected}")
+    print_state(
+        daemon_request(
+            "POST",
+            f"/internal/secrets/{environment.value}/rotate",
+            payload={"account_address": account_address},
+        )
+    )
 
 
 @secret_app.command("status")
-def secret_status() -> None:
-    paths, _, _, _ = context()
-    store = DPAPISecretStore(paths.secret_file)
-    console.print("[green]CONFIGURADO[/]" if store.exists() else "[yellow]NÃO CONFIGURADO[/]")
+def secret_status(environment: Environment = typer.Option(..., "--environment")) -> None:
+    require_wallet_environment(environment)
+    print_state(daemon_request("GET", f"/internal/secrets/{environment.value}/status"))
 
 
 @data_app.command("sync")
@@ -386,9 +434,22 @@ def research_train(dataset_id: str | None = None) -> None:
         fail(f"Dataset não encontrado: {dataset_id}")
     with console.status("Gerando features e treinando LightGBM calibrado..."):
         enriched = SignalGenerator(settings.strategy).enrich(manager.load(manifest.path))
-        result = MetaModelRegistry(paths).train(enriched, seed=settings.backtest.random_seed)
+        result = MetaModelRegistry(paths, settings.research, settings.execution).train(
+            enriched,
+            seed=settings.backtest.random_seed,
+            dataset_role=manifest.role,
+            dataset_hashes=(manifest.sha256,),
+            config_fingerprint=stable_fingerprint(settings.model_dump(mode="json")),
+            code_hash=research_code_fingerprint(),
+            commit_hash=git_commit_fingerprint(paths.root),
+        )
     console.print_json(
-        data={"model_id": result.model_id, "hash": result.model_hash, **result.metrics}
+        data={
+            "model_id": result.model_id,
+            "hash": result.model_hash,
+            "decision_policy_id": result.decision_policy_id,
+            **result.metrics,
+        }
     )
 
 
@@ -418,9 +479,107 @@ def research_evaluate() -> None:
 def research_promote(
     model_id: str, gate: Path = typer.Option(..., exists=True, dir_okay=False)
 ) -> None:
-    paths, _, _, _ = context()
-    pointer = MetaModelRegistry(paths).promote(model_id, gate)
+    paths, settings, _, _ = context()
+    pointer = MetaModelRegistry(paths, settings.research, settings.execution).promote(
+        model_id, gate
+    )
     console.print_json(data=pointer)
+
+
+def manifest_by_id(
+    manager: DatasetManager,
+    paths: AppPaths,
+    dataset_id: str | None,
+) -> DatasetManifest:
+    manifest = (
+        latest_manifest(paths)
+        if dataset_id is None
+        else next(
+            (item for item in manager.list_manifests() if item.dataset_id == dataset_id),
+            None,
+        )
+    )
+    if manifest is None:
+        fail(f"Dataset não encontrado: {dataset_id}")
+    return manifest
+
+
+@research_app.command("diagnose")
+def research_diagnose(
+    dataset_id: str = typer.Option(..., "--dataset-id"),
+    model_id: str | None = typer.Option(None, "--model-id"),
+) -> None:
+    """Exporta telemetria completa do funil; baseline sem ML nunca produz gate."""
+    paths, settings, _, _ = context()
+    manager = DatasetManager(paths, settings)
+    manifest = manifest_by_id(manager, paths, dataset_id)
+    if manifest.role == "external_holdout":
+        fail(
+            "Diagnóstico/challenger é proibido no external_holdout; "
+            "use uma única vez `backtest run --model-id`"
+        )
+    market = manager.load(manifest.path)
+    registry = MetaModelRegistry(paths, settings.research, settings.execution)
+    if model_id:
+        bundle = registry.load_candidate(model_id)
+        policy = registry.load_decision_policy(model_id)
+        enriched = SignalGenerator(settings.strategy, registry).enrich(
+            market,
+            model_bundle=bundle,
+            model_id=model_id,
+            decision_policy=policy,
+        )
+    else:
+        enriched = SignalGenerator(settings.strategy).enrich(market)
+    with console.status("Gerando funil quantitativo e calibração..."):
+        result = EventBacktester(settings, paths).run(
+            market,
+            source=f"{manifest.source}-diagnose",
+            dataset_hash=manifest.sha256,
+            enriched_override=enriched,
+            model_id=model_id,
+            run_stress_suite=False,
+        )
+    console.print_json(
+        data={
+            "run_id": result.run_id,
+            "baseline_without_ml": model_id is None,
+            "gate_eligible": model_id is not None,
+            "artifacts": {
+                key: str(value)
+                for key, value in result.artifacts.items()
+                if key.startswith("funnel_") or key == "probability_calibration"
+            },
+        }
+    )
+
+
+@research_app.command("regimes")
+def research_regimes(dataset_id: str = typer.Option(..., "--dataset-id")) -> None:
+    """Executa a ablação formal dev-only; o resultado é challenger sem promoção."""
+    paths, settings, _, _ = context()
+    manager = DatasetManager(paths, settings)
+    manifest = manifest_by_id(manager, paths, dataset_id)
+    if manifest.role != "development":
+        fail("Estudo de regimes aceita somente dataset development")
+    with console.status("Executando walk-forward e ablação event-driven de regimes..."):
+        result, report = run_backtest(dataset_id=dataset_id, include_regime_study=True)
+    regime_artifacts = {
+        key: str(value)
+        for key, value in result.artifacts.items()
+        if key.startswith("regime_") or key in {"strategy_ablation_csv", "weekly_decisions_csv"}
+    }
+    if not regime_artifacts:
+        fail("O run não produziu artefatos formais de regime")
+    console.print_json(
+        data={
+            "run_id": result.run_id,
+            "challenger_only": True,
+            "gate_eligible": False,
+            "report": str(report),
+            "artifacts": regime_artifacts,
+        }
+    )
 
 
 def run_backtest(
@@ -429,6 +588,7 @@ def run_backtest(
     source_contains: str | None = None,
     stress_only: bool = False,
     model_id: str | None = None,
+    include_regime_study: bool = False,
 ) -> tuple[Any, Path]:
     paths, settings, _, _ = context()
     manager = DatasetManager(paths, settings)
@@ -454,6 +614,7 @@ def run_backtest(
                 market,
                 source=manifest.source,
                 dataset_hash=manifest.sha256,
+                run_regime_study=include_regime_study,
             )
         else:
             result = EventBacktester(settings, paths).run(
@@ -464,6 +625,7 @@ def run_backtest(
                 cost_multiplier=2.0 if stress_only else 1.0,
                 signal_delay_hours=2 if stress_only else 1,
                 missing_fraction=0.005 if stress_only else 0,
+                run_regime_study=include_regime_study,
             )
         report = generate_report(result)
     return result, report
@@ -668,6 +830,12 @@ def testnet_reconcile() -> None:
     print_state(daemon_request("POST", "/testnet/reconcile", timeout=30.0))
 
 
+@testnet_app.command("certificate")
+def testnet_certificate() -> None:
+    """Mostra o certificado content-addressed; não executa smoke nem envia ordens."""
+    print_state(daemon_request("GET", "/internal/testnet/certificate/status"))
+
+
 @release_app.command("build")
 def release_build() -> None:
     """Constrói no daemon um manifesto de release imutável e não aprovado."""
@@ -704,3 +872,93 @@ def release_approve(
             timeout=30.0,
         )
     )
+
+
+@mainnet_app.command("authorize")
+def mainnet_authorize(
+    budget_usdc: float = typer.Option(..., min=0.01, max=500.0),
+    confirm: str = typer.Option(..., prompt=True),
+) -> None:
+    """Emite capability DPAPI de 15 minutos; não arma nem envia ordens."""
+    print_state(
+        daemon_request(
+            "POST",
+            "/internal/mainnet/authorize",
+            payload={"budget_usdc": budget_usdc, "confirmation": confirm},
+            timeout=30.0,
+        )
+    )
+
+
+@mainnet_app.command("status")
+def mainnet_status() -> None:
+    print_state(daemon_request("GET", "/internal/mainnet/authorization/status"))
+
+
+@mainnet_app.command("revoke")
+def mainnet_revoke(
+    authorization_id: str,
+    confirm: str = typer.Option(..., prompt=True),
+) -> None:
+    expected = f"REVOKE MAINNET {authorization_id}"
+    if confirm != expected:
+        fail(f"Confirmação inválida. Digite exatamente: {expected}")
+    print_state(
+        daemon_request(
+            "POST",
+            "/internal/mainnet/authorization/revoke",
+            payload={"authorization_id": authorization_id},
+        )
+    )
+
+
+def print_operation(value: object) -> None:
+    if isinstance(value, tuple):
+        payload: object = [
+            asdict(cast(Any, item)) if is_dataclass(item) else item for item in value
+        ]
+    elif is_dataclass(value):
+        payload = asdict(cast(Any, value))
+    else:
+        payload = value
+    console.print_json(data=payload)
+
+
+def operations_manager() -> OperationsManager:
+    paths = AppPaths.discover()
+    settings = Settings.load(paths.config)
+    paths.ensure()
+    return OperationsManager(paths, settings.operations)
+
+
+def operation_call(action: str, *args: object) -> None:
+    try:
+        result = getattr(operations_manager(), action)(*args)
+    except OperationsError as exc:
+        fail(str(exc))
+    print_operation(result)
+
+
+@ops_app.command("install")
+def ops_install(confirm: str = typer.Option(..., prompt=True)) -> None:
+    operation_call("install_tasks", confirm)
+
+
+@ops_app.command("status")
+def ops_status() -> None:
+    operation_call("task_status")
+
+
+@ops_app.command("backup")
+def ops_backup() -> None:
+    operation_call("backup")
+
+
+@ops_app.command("restore-dry-run")
+def ops_restore_dry_run(backup_id: str) -> None:
+    operation_call("restore_dry_run", backup_id)
+
+
+@ops_app.command("uninstall")
+def ops_uninstall(confirm: str = typer.Option(..., prompt=True)) -> None:
+    operation_call("uninstall_tasks", confirm)

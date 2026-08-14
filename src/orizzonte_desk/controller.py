@@ -2,10 +2,17 @@ from __future__ import annotations
 
 import json
 import math
-from datetime import UTC, datetime
+import uuid
+from datetime import UTC, datetime, timedelta
 from hashlib import sha256
 from pathlib import Path
+from typing import Any, cast
 
+from orizzonte_desk.chaos import (
+    ChaosValidationError,
+    TestnetChaosContext,
+    TestnetChaosRunner,
+)
 from orizzonte_desk.config import Settings
 from orizzonte_desk.constants import LIVE_CONFIRMATION_PREFIX
 from orizzonte_desk.exchange import (
@@ -14,10 +21,22 @@ from orizzonte_desk.exchange import (
     PaperGateway,
     TradingGateway,
 )
-from orizzonte_desk.models import AgentState, AgentStatus, Environment, Side, Signal
+from orizzonte_desk.models import (
+    AgentState,
+    AgentStatus,
+    Environment,
+    MainnetAuthorization,
+    Side,
+    Signal,
+    TestnetCertificate,
+)
 from orizzonte_desk.paths import AppPaths
 from orizzonte_desk.release import ReleaseError, ReleaseManager, ReleaseManifest
-from orizzonte_desk.secrets import DPAPISecretStore
+from orizzonte_desk.secrets import (
+    DPAPICapabilityStore,
+    EnvironmentSecretManager,
+    SecretStoreError,
+)
 from orizzonte_desk.storage import StateStore
 
 
@@ -26,11 +45,20 @@ class ControlError(RuntimeError):
 
 
 class AgentController:
-    def __init__(self, paths: AppPaths, settings: Settings, store: StateStore) -> None:
+    def __init__(
+        self,
+        paths: AppPaths,
+        settings: Settings,
+        store: StateStore,
+        *,
+        chaos_runner: TestnetChaosRunner | None = None,
+    ) -> None:
         self.paths = paths
         self.settings = settings
         self.store = store
-        self.secrets = DPAPISecretStore(paths.secret_file)
+        self.wallets = EnvironmentSecretManager(paths.secrets)
+        self.capabilities = DPAPICapabilityStore(paths.secrets)
+        self.chaos_runner = chaos_runner or TestnetChaosRunner()
         self._paper_gateway = PaperGateway(
             settings.backtest.initial_capital,
             store=store,
@@ -52,15 +80,24 @@ class AgentController:
             raise ControlError(f"Agente precisa estar desarmado; estado atual: {state.status}")
         if budget_usdc <= 0:
             raise ControlError("Orçamento deve ser positivo")
-        if environment is Environment.MAINNET:
+        if (
+            environment is Environment.MAINNET
+            and budget_usdc > self.settings.mainnet.initial_budget_cap_usdc
+        ):
             raise ControlError(
-                "Mainnet está bloqueada nesta versão; somente paper e testnet são autorizados"
+                f"Budget mainnet excede cap inicial de "
+                f"{self.settings.mainnet.initial_budget_cap_usdc:.2f} USDC"
             )
         expected = self.expected_confirmation(environment, budget_usdc)
         if confirmation != expected:
             raise ControlError(f"Confirmação inválida. Digite exatamente: {expected}")
         self.paths.assert_free_space(self.settings.app.minimum_free_gb)
-        gateway = self.gateway(environment)
+        release: ReleaseManifest | None = None
+        try:
+            gateway = self.gateway(environment)
+        except SecretStoreError as exc:
+            label = "Mainnet" if environment is Environment.MAINNET else environment.value
+            raise ControlError(f"{label}: cofre ausente ou inválido: {exc}") from exc
         if environment is not Environment.PAPER:
             self._validate_research_approval()
             self._validate_promoted_model()
@@ -82,8 +119,23 @@ class AgentController:
                 f"Orçamento {budget_usdc:.2f} excede equity disponível {snapshot.equity:.2f}"
             )
         account = None
+        wallet = None
         if environment is not Environment.PAPER:
-            account = str(self.secrets.load()["account_address"]).lower()
+            wallet_payload = self.wallets.load(environment)
+            account = str(wallet_payload["account_address"]).lower()
+            wallet = str(wallet_payload["wallet_address"]).lower()
+        authorization: MainnetAuthorization | None = None
+        session_id = uuid.uuid4().hex
+        if environment is Environment.MAINNET:
+            if release is None or account is None or wallet is None:
+                raise ControlError("Bindings mainnet incompletos")
+            authorization = self._consume_mainnet_capability(
+                release=release,
+                budget_usdc=budget_usdc,
+                account_address=account,
+                wallet_address=wallet,
+                session_id=session_id,
+            )
         armed = AgentState(
             status=AgentStatus.ARMED,
             environment=environment,
@@ -95,10 +147,15 @@ class AgentController:
                 "preflight_equity": snapshot.equity,
                 "isolated_leverage": 10,
                 "preflight": preflight,
-                "release_id": (
-                    release.release_id if environment is not Environment.PAPER else None
-                ),
+                "release_id": (release.release_id if release is not None else None),
                 "reconciled_at": datetime.now(UTC).isoformat(),
+                "session_id": session_id,
+                "authorization_id": (
+                    authorization.authorization_id if authorization is not None else None
+                ),
+                "certificate_id": (
+                    authorization.certificate_id if authorization is not None else None
+                ),
             },
         )
         self.store.save_agent_state(armed)
@@ -123,16 +180,27 @@ class AgentController:
         return running
 
     def _revalidate_session(self, state: AgentState) -> None:
-        if state.environment is Environment.MAINNET:
-            raise ControlError("Mainnet está permanentemente bloqueada nesta versão")
         self._validate_research_approval()
         self._validate_promoted_model()
         release = self._validate_approved_release()
         if state.metadata.get("release_id") != release.release_id:
             raise ControlError("Release da sessão mudou; desarme e arme novamente")
         self._assert_no_persistent_lock()
-        known_symbols = {item["symbol"] for item in self.store.positions()}
-        known_cloids = {item["client_order_id"] for item in self.store.orders()}
+        account = state.account_address or "paper"
+        known_symbols = {
+            item["symbol"]
+            for item in self.store.positions(
+                environment=state.environment,
+                account_address=account,
+            )
+        }
+        known_cloids = {
+            item["client_order_id"]
+            for item in self.store.orders(
+                environment=state.environment,
+                account_address=account,
+            )
+        }
         gateway = self.gateway(state.environment)
         if not isinstance(gateway, HyperliquidGateway):
             raise ControlError("Gateway live inválido")
@@ -156,6 +224,22 @@ class AgentController:
                 "Exposição manual detectada durante resume: "
                 f"positions={sorted(manual_symbols)}, orders={sorted(manual_orders)}"
             )
+        if state.environment is Environment.MAINNET and state.metadata.get(
+            "requires_mainnet_reauthorization", False
+        ):
+            wallet_payload = self.wallets.load(Environment.MAINNET)
+            resumed_session_id = uuid.uuid4().hex
+            authorization = self._consume_mainnet_capability(
+                release=release,
+                budget_usdc=float(state.budget_usdc or 0),
+                account_address=str(wallet_payload["account_address"]),
+                wallet_address=str(wallet_payload["wallet_address"]),
+                session_id=resumed_session_id,
+            )
+            state.metadata["authorization_id"] = authorization.authorization_id
+            state.metadata["session_id"] = resumed_session_id
+            state.metadata["certificate_id"] = authorization.certificate_id
+            state.metadata.pop("requires_mainnet_reauthorization", None)
         state.metadata["preflight"] = preflight
         state.metadata["reconciled_at"] = datetime.now(UTC).isoformat()
         state.metadata.pop("restart_reconcile_required", None)
@@ -165,7 +249,10 @@ class AgentController:
         state = self.store.agent_state()
         if state.status is not AgentStatus.RUNNING:
             raise ControlError("Somente um agente em execução pode ser pausado")
-        paused = state.model_copy(update={"status": AgentStatus.PAUSED})
+        metadata = dict(state.metadata)
+        if state.environment is Environment.MAINNET:
+            metadata["requires_mainnet_reauthorization"] = True
+        paused = state.model_copy(update={"status": AgentStatus.PAUSED, "metadata": metadata})
         self.store.save_agent_state(paused)
         self.store.event("control", "Novas entradas pausadas")
         return paused
@@ -203,7 +290,7 @@ class AgentController:
     def gateway(self, environment: Environment) -> TradingGateway:
         if environment is Environment.PAPER:
             return self._paper_gateway
-        payload = self.secrets.load()
+        payload = self.wallets.load(environment)
         return HyperliquidGateway(
             secret_key=str(payload["secret_key"]),
             account_address=str(payload["account_address"]),
@@ -290,12 +377,18 @@ class AgentController:
         self._assert_testnet_operation_allowed()
         gateway = self.gateway(Environment.TESTNET)
         snapshot = gateway.reconcile()
+        payload = self.wallets.load(Environment.TESTNET)
         return {
             "environment": Environment.TESTNET.value,
             "equity": snapshot.equity,
             "positions": len(snapshot.positions),
             "orders": len(snapshot.open_orders),
-            "fills_persisted": len(self.store.fills()),
+            "fills_persisted": len(
+                self.store.fills(
+                    environment=Environment.TESTNET,
+                    account_address=str(payload["account_address"]),
+                )
+            ),
         }
 
     def testnet_smoke(self, *, budget_usdc: float, confirmation: str) -> dict[str, object]:
@@ -338,7 +431,7 @@ class AgentController:
         )
         lifecycle: dict[str, object] = {"preflight": preflight}
         try:
-            gateway.schedule_dead_man(30)
+            lifecycle["dead_man"] = gateway.schedule_dead_man(30)
             lifecycle["entry"] = gateway.place_entry_with_protection(
                 signal,
                 size=size,
@@ -346,7 +439,15 @@ class AgentController:
                 take_profit_price=price * 1.01,
                 slippage=0.01,
             )
-            lifecycle["after_entry"] = _snapshot_counts(gateway.reconcile())
+            after_entry = gateway.reconcile()
+            lifecycle["after_entry"] = _snapshot_counts(after_entry)
+            lifecycle["protection_evidence"] = {
+                "position": next(
+                    (item for item in after_entry.positions if item.get("coin") == "BTC"),
+                    None,
+                ),
+                "orders": [item for item in after_entry.open_orders if item.get("coin") == "BTC"],
+            }
             # Constructing a new adapter simulates a process restart and forces REST recovery.
             restarted = self.gateway(Environment.TESTNET)
             lifecycle["after_restart"] = _snapshot_counts(restarted.reconcile())
@@ -370,8 +471,307 @@ class AgentController:
                 payload={"final": final},
             )
             raise ControlError("Smoke testnet deixou ordens ou posições residuais")
+        try:
+            chaos_report = self.chaos_runner.run(TestnetChaosContext(lifecycle=lifecycle))
+        except ChaosValidationError as exc:
+            raise ControlError(f"Certificado testnet recusado pelo chaos gate: {exc}") from exc
+        if not self.chaos_runner.verify(chaos_report):
+            raise ControlError("Certificado testnet recusado: relatório de caos inválido")
+        lifecycle["chaos"] = chaos_report
         self.store.event("testnet", "Smoke testnet concluído", payload=lifecycle)
+        release = self._validate_approved_release()
+        model_hash, gates_hash = _release_bindings(release)
+        account_address = str(preflight.get("account_address", "")).lower()
+        wallet_address = str(preflight.get("wallet_address", "")).lower()
+        evidence = (
+            _json_hash(lifecycle),
+            _json_hash(
+                self.store.fills(
+                    environment=Environment.TESTNET,
+                    account_address=account_address,
+                )
+            ),
+        )
+        certificate = TestnetCertificate.build(
+            release_id=release.release_id,
+            model_hash=model_hash,
+            gates_hash=gates_hash,
+            account_address=account_address,
+            wallet_address=wallet_address,
+            evidence_hashes=evidence,
+            required_scenarios=tuple(cast(list[str], chaos_report["required_scenarios"])),
+            scenario_results=dict(cast(dict[str, bool], chaos_report["results"])),
+            scenario_hashes=dict(cast(dict[str, str], chaos_report["scenario_hashes"])),
+            chaos_report_hash=str(chaos_report["report_hash"]),
+        )
+        if not certificate.verify_content_address():
+            raise ControlError("Certificado testnet falhou na verificação content-addressed")
+        self.store.save_testnet_certificate(certificate)
+        lifecycle["certificate"] = certificate.model_dump(mode="json")
         return lifecycle
+
+    def secret_generate(
+        self,
+        environment: Environment,
+        *,
+        secret_key: str | None = None,
+        account_address: str,
+    ) -> dict[str, Any]:
+        self._assert_secret_mutation_allowed(environment)
+        try:
+            return self.wallets.generate(
+                environment,
+                secret_key=secret_key,
+                account_address=account_address,
+            )
+        except Exception as exc:
+            raise ControlError(f"Falha ao gerar cofre {environment.value}: {exc}") from exc
+
+    def secret_verify(self, environment: Environment) -> dict[str, Any]:
+        try:
+            return self.wallets.verify(environment)
+        except Exception as exc:
+            raise ControlError(f"Falha ao verificar cofre {environment.value}: {exc}") from exc
+
+    def secret_rotate(
+        self,
+        environment: Environment,
+        *,
+        secret_key: str | None = None,
+        account_address: str,
+    ) -> dict[str, Any]:
+        self._assert_secret_mutation_allowed(environment)
+        try:
+            return self.wallets.rotate(
+                environment,
+                secret_key=secret_key,
+                account_address=account_address,
+            )
+        except Exception as exc:
+            raise ControlError(f"Falha ao rotacionar cofre {environment.value}: {exc}") from exc
+
+    def secret_status(self, environment: Environment) -> dict[str, Any]:
+        try:
+            return self.wallets.status(environment, verify=False)
+        except Exception as exc:
+            raise ControlError(f"Falha ao consultar cofre {environment.value}: {exc}") from exc
+
+    def issue_mainnet_authorization(
+        self, *, budget_usdc: float, confirmation: str
+    ) -> dict[str, Any]:
+        if budget_usdc <= 0 or budget_usdc > self.settings.mainnet.initial_budget_cap_usdc:
+            raise ControlError(
+                f"Budget deve estar entre 0 e {self.settings.mainnet.initial_budget_cap_usdc:.2f}"
+            )
+        state = self.store.agent_state()
+        if state.status is not AgentStatus.DISARMED and not (
+            state.status is AgentStatus.PAUSED and state.environment is Environment.MAINNET
+        ):
+            raise ControlError("Autorização mainnet exige agente desarmado ou mainnet pausada")
+        release = self._validate_approved_release()
+        self._validate_research_approval()
+        self._validate_promoted_model()
+        self._assert_no_persistent_lock()
+        certificate = self.store.latest_testnet_certificate()
+        if certificate is None or not certificate.verify_content_address():
+            raise ControlError("Certificado testnet content-addressed válido está ausente")
+        bindings = _mainnet_release_bindings(release)
+        model_hash = bindings["model_hash"]
+        gates_hash = bindings["gates_hash"]
+        if (
+            certificate.release_id != release.release_id
+            or certificate.model_hash != model_hash
+            or certificate.gates_hash != gates_hash
+        ):
+            raise ControlError("Certificado testnet não corresponde à release/modelo/gates")
+        try:
+            wallet_status = self.wallets.verify(Environment.MAINNET)
+            wallet_payload = self.wallets.load(Environment.MAINNET)
+        except SecretStoreError as exc:
+            raise ControlError(f"Cofre mainnet inválido: {exc}") from exc
+        account = str(wallet_payload["account_address"]).lower()
+        wallet = str(wallet_payload["wallet_address"]).lower()
+        expected = f"AUTHORIZE MAINNET {release.release_id} {account} {budget_usdc:.2f}"
+        if confirmation != expected:
+            raise ControlError(f"Confirmação inválida. Digite exatamente: {expected}")
+        if certificate.account_address != account:
+            raise ControlError("Certificado testnet não vincula a mesma conta principal")
+        gateway = self.gateway(Environment.MAINNET)
+        if not isinstance(gateway, HyperliquidGateway):
+            raise ControlError("Gateway mainnet inválido")
+        try:
+            gateway.preflight(require_empty=state.status is AgentStatus.DISARMED)
+        except Exception as exc:
+            raise ControlError(f"Preflight mainnet read-only falhou: {exc}") from exc
+        issued_at = datetime.now(UTC)
+        authorization = MainnetAuthorization(
+            authorization_id=uuid.uuid4().hex,
+            release_id=release.release_id,
+            certificate_id=certificate.certificate_id,
+            model_hash=model_hash,
+            gates_hash=gates_hash,
+            git_commit=bindings["git_commit"],
+            config_sha256=bindings["config_sha256"],
+            config_fingerprint=bindings["config_fingerprint"],
+            code_hash=bindings["code_hash"],
+            account_address=account,
+            wallet_address=wallet,
+            budget_usdc=budget_usdc,
+            issued_at=issued_at,
+            expires_at=issued_at
+            + timedelta(seconds=self.settings.mainnet.authorization_ttl_seconds),
+        )
+        token_hash = self.capabilities.issue(authorization)
+        try:
+            self.store.save_mainnet_authorization(authorization, token_hash=token_hash)
+        except Exception:
+            self.capabilities.delete(authorization.authorization_id)
+            raise
+        self.store.set(
+            "pending_mainnet_authorization",
+            {"authorization_id": authorization.authorization_id},
+        )
+        self.store.clear_lock("mainnet_authorization")
+        return authorization.model_dump(mode="json") | {
+            "capability": self.capabilities.status(authorization.authorization_id),
+            "wallet": wallet_status,
+        }
+
+    def mainnet_authorization_status(self) -> dict[str, Any]:
+        pointer = self.store.get("pending_mainnet_authorization")
+        if not isinstance(pointer, dict) or not pointer.get("authorization_id"):
+            return {"available": False, "locked": True}
+        authorization_id = str(pointer["authorization_id"])
+        row = self.store.authorization(authorization_id)
+        try:
+            capability = self.capabilities.status(authorization_id)
+        except SecretStoreError as exc:
+            capability = {
+                "authorization_id": authorization_id,
+                "available": False,
+                "error": str(exc),
+            }
+        expired = True
+        if row and row.get("expires_at"):
+            try:
+                expired = datetime.fromisoformat(str(row["expires_at"])) <= datetime.now(UTC)
+            except ValueError:
+                expired = True
+        available = bool(
+            row
+            and not row.get("consumed_at")
+            and not row.get("revoked_at")
+            and not expired
+            and capability.get("available")
+        )
+        return {
+            "available": available,
+            "locked": not available,
+            "expired": expired,
+            "authorization": row,
+            "capability": capability,
+        }
+
+    def revoke_mainnet_authorization(self, authorization_id: str) -> dict[str, Any]:
+        revoked = self.store.revoke_mainnet_authorization(authorization_id)
+        self.capabilities.delete(authorization_id)
+        pointer = self.store.get("pending_mainnet_authorization")
+        if isinstance(pointer, dict) and pointer.get("authorization_id") == authorization_id:
+            self.store.set("pending_mainnet_authorization", None)
+        self.store.latch_lock(
+            "mainnet_authorization",
+            reason="Capability mainnet ausente ou revogada",
+            payload={"authorization_id": authorization_id},
+        )
+        return {"authorization_id": authorization_id, "revoked": revoked}
+
+    def testnet_certificate_status(self) -> dict[str, Any]:
+        certificate = self.store.latest_testnet_certificate()
+        if certificate is None:
+            return {"available": False}
+        return certificate.model_dump(mode="json") | {
+            "available": True,
+            "valid": certificate.verify_content_address(),
+        }
+
+    def _consume_mainnet_capability(
+        self,
+        *,
+        release: ReleaseManifest,
+        budget_usdc: float,
+        account_address: str,
+        wallet_address: str,
+        session_id: str,
+    ) -> MainnetAuthorization:
+        pointer = self.store.get("pending_mainnet_authorization")
+        if not isinstance(pointer, dict) or not pointer.get("authorization_id"):
+            self.store.latch_lock(
+                "mainnet_authorization",
+                reason="Capability mainnet de uso único ausente",
+            )
+            raise ControlError("Mainnet bloqueada: capability DPAPI ausente")
+        authorization_id = str(pointer["authorization_id"])
+        try:
+            capability = self.capabilities.load(authorization_id)
+            token_hash = sha256(str(capability["token"]).encode()).hexdigest()
+            certificate = self.store.testnet_certificate(str(capability["certificate_id"]))
+            if certificate is None or not certificate.verify_content_address():
+                raise ValueError("Certificado testnet inválido")
+            bindings = _mainnet_release_bindings(release)
+            expected_capability: dict[str, object] = {
+                "release_id": release.release_id,
+                "certificate_id": certificate.certificate_id,
+                "model_hash": bindings["model_hash"],
+                "gates_hash": bindings["gates_hash"],
+                "git_commit": bindings["git_commit"],
+                "config_sha256": bindings["config_sha256"],
+                "config_fingerprint": bindings["config_fingerprint"],
+                "code_hash": bindings["code_hash"],
+                "account_address": account_address.lower(),
+                "wallet_address": wallet_address.lower(),
+            }
+            for key, expected in expected_capability.items():
+                actual = capability.get(key)
+                if "address" in key:
+                    actual = str(actual).lower()
+                if actual != expected:
+                    raise ValueError(f"Binding DPAPI divergente: {key}")
+            if abs(float(capability.get("budget_usdc", 0)) - budget_usdc) > 1e-9:
+                raise ValueError("Binding DPAPI divergente: budget_usdc")
+            authorization = self.store.consume_mainnet_authorization(
+                authorization_id,
+                token_hash=token_hash,
+                session_id=session_id,
+                release_id=release.release_id,
+                certificate_id=certificate.certificate_id,
+                model_hash=bindings["model_hash"],
+                gates_hash=bindings["gates_hash"],
+                git_commit=bindings["git_commit"],
+                config_sha256=bindings["config_sha256"],
+                config_fingerprint=bindings["config_fingerprint"],
+                code_hash=bindings["code_hash"],
+                account_address=account_address,
+                wallet_address=wallet_address,
+                budget_usdc=budget_usdc,
+            )
+        except Exception as exc:
+            self.store.latch_lock(
+                "mainnet_authorization",
+                reason="Capability mainnet inválida, expirada ou divergente",
+                payload={"authorization_id": authorization_id, "error": str(exc)},
+            )
+            raise ControlError(f"Mainnet bloqueada: {exc}") from exc
+        self.capabilities.delete(authorization_id)
+        self.store.set("pending_mainnet_authorization", None)
+        self.store.clear_lock("mainnet_authorization")
+        return authorization
+
+    def _assert_secret_mutation_allowed(self, environment: Environment) -> None:
+        if environment is Environment.PAPER:
+            raise ControlError("Paper não possui cofre de API wallet")
+        state = self.store.agent_state()
+        if state.status is not AgentStatus.DISARMED:
+            raise ControlError("Geração/rotação de segredo exige agente desarmado")
 
     def _assert_testnet_operation_allowed(self) -> None:
         state = self.store.agent_state()
@@ -420,3 +820,44 @@ def _snapshot_counts(snapshot: AccountSnapshot) -> dict[str, object]:
         "positions": len(snapshot.positions),
         "orders": len(snapshot.open_orders),
     }
+
+
+def _release_bindings(release: ReleaseManifest) -> tuple[str, str]:
+    try:
+        return (
+            str(release.artifacts["model"]["sha256"]),
+            str(release.artifacts["research_approval"]["sha256"]),
+        )
+    except KeyError as exc:
+        raise ControlError("Release não possui bindings de modelo/gates") from exc
+
+
+def _mainnet_release_bindings(release: ReleaseManifest) -> dict[str, str]:
+    model_hash, gates_hash = _release_bindings(release)
+    try:
+        config_sha256 = str(release.artifacts["config"]["sha256"])
+        gate_path = Path(release.artifacts["research_approval"]["path"])
+        gate = json.loads(gate_path.read_text(encoding="utf-8"))
+        binding = gate["release_binding"]
+        git_commit = str(release.git_commit)
+        config_fingerprint = str(binding["config_fingerprint"])
+        code_hash = str(binding["code_hash"])
+        gate_commit = str(binding["commit_hash"])
+    except (KeyError, OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        raise ControlError("Release lacks mainnet commit/configuration/code bindings") from exc
+    values = {
+        "model_hash": model_hash,
+        "gates_hash": gates_hash,
+        "git_commit": git_commit,
+        "config_sha256": config_sha256,
+        "config_fingerprint": config_fingerprint,
+        "code_hash": code_hash,
+    }
+    if gate_commit != git_commit or any(not value for value in values.values()):
+        raise ControlError("Release/gate mainnet binding is empty or divergent")
+    return values
+
+
+def _json_hash(value: object) -> str:
+    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str).encode()
+    return sha256(encoded).hexdigest()

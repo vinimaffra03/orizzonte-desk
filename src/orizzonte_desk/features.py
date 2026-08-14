@@ -143,6 +143,11 @@ def _symbol_features(frame: pd.DataFrame, config: StrategyConfig) -> pd.DataFram
         base["close"] * 0.005,
     )
     forward_return = base["close"].shift(-24) / base["close"] - 1
+    base["forward_return_24h"] = forward_return
+    base["realized_return_24h"] = forward_return * base["signal_raw"]
+    risk_fraction = (base["stop_distance"] / base["close"]).replace(0, np.nan)
+    base["forward_r_24h"] = forward_return / risk_fraction
+    base["realized_r_24h"] = base["realized_return_24h"] / risk_fraction
     base["label"] = (
         forward_return * base["signal_raw"] > np.maximum(base["atr_pct_1h"] * 1.5, 0.003)
     ).astype(float)
