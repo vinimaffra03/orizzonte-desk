@@ -43,16 +43,80 @@ def evaluate_gate(
     )
 
 
-def save_gate(result: GateResult, path: Path) -> Path:
+def save_gate(
+    result: GateResult,
+    path: Path,
+    *,
+    release_binding: dict[str, Any] | None = None,
+) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(result.model_dump_json(indent=2), encoding="utf-8")
+    payload = result.model_dump(mode="json")
+    if release_binding is not None:
+        payload["release_binding"] = release_binding
+    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
     return path
 
 
 def load_combined_gate(paths: list[Path]) -> dict[str, Any]:
     payloads = [json.loads(path.read_text(encoding="utf-8")) for path in paths]
+    bindings = [item.get("release_binding", {}) for item in payloads]
+    shared_keys = ("config_fingerprint", "code_hash", "commit_hash")
+    shared_invariants_match = (
+        bool(bindings)
+        and all(all(binding.get(key) for key in shared_keys) for binding in bindings)
+        and all(
+            all(binding.get(key) == bindings[0].get(key) for key in shared_keys)
+            for binding in bindings[1:]
+        )
+    )
+    protocol_pairs = [
+        (payload, binding)
+        for payload, binding in zip(payloads, bindings, strict=True)
+        if binding.get("evaluation_scope") == "training_protocol"
+    ]
+    candidate_pairs = [
+        (payload, binding)
+        for payload, binding in zip(payloads, bindings, strict=True)
+        if binding.get("evaluation_scope", "candidate") == "candidate"
+    ]
+    candidate_hashes = {
+        str(binding["model_hash"]) for _, binding in candidate_pairs if binding.get("model_hash")
+    }
+    candidate_model_hash = next(iter(candidate_hashes)) if len(candidate_hashes) == 1 else None
+    model_binding_valid = (
+        bool(candidate_pairs)
+        and candidate_model_hash is not None
+        and all(
+            payload.get("model_hash") == candidate_model_hash
+            and binding.get("model_hash") == candidate_model_hash
+            for payload, binding in candidate_pairs
+        )
+    )
+    protocol_binding_valid = bool(protocol_pairs) and all(
+        binding.get("protocol_hash")
+        and not binding.get("model_hash")
+        and not payload.get("model_hash")
+        for payload, binding in protocol_pairs
+    )
+    bindings_match = shared_invariants_match and model_binding_valid and protocol_binding_valid
+    protocol_hashes = sorted({str(binding["protocol_hash"]) for _, binding in protocol_pairs})
     return {
-        "passed": bool(payloads) and all(item.get("passed", False) for item in payloads),
+        "passed": (
+            bool(payloads)
+            and all(item.get("passed", False) for item in payloads)
+            and bindings_match
+        ),
         "gates": payloads,
+        "bindings_match": bindings_match,
+        "model_hash": candidate_model_hash,
+        "release_binding": {
+            **({key: bindings[0].get(key) for key in shared_keys} if bindings else {}),
+            "model_hash": candidate_model_hash,
+            "evaluation_scope": "combined_release",
+            "protocol_hashes": protocol_hashes,
+            "dataset_hashes": sorted(
+                {value for binding in bindings for value in binding.get("dataset_hashes", [])}
+            ),
+        },
         "evaluated_at": datetime.now(UTC).isoformat(),
     }

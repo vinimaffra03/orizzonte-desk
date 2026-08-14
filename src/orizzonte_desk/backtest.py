@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any, cast
@@ -13,6 +13,7 @@ import pandas as pd
 
 from orizzonte_desk.config import Settings
 from orizzonte_desk.constants import SYMBOLS
+from orizzonte_desk.data import stable_fingerprint
 from orizzonte_desk.features import prepare_features
 from orizzonte_desk.gates import evaluate_gate, save_gate
 from orizzonte_desk.metrics import MetricsBundle, calculate_metrics
@@ -31,6 +32,7 @@ class BacktestResult:
     stressed_metrics: MetricsBundle
     gate_path: Path
     artifacts: dict[str, Path]
+    stress_results: dict[str, dict[str, float]] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -63,23 +65,34 @@ class EventBacktester:
         seed: int | None = None,
         persist: bool = True,
         enriched_override: pd.DataFrame | None = None,
+        model_id: str | None = None,
+        run_stress_suite: bool = True,
+        evaluation_scope: str = "candidate",
+        protocol_hash: str | None = None,
     ) -> BacktestResult:
         from orizzonte_desk.ml import MetaModelRegistry
 
+        if evaluation_scope not in {"candidate", "training_protocol"}:
+            raise ValueError(f"Escopo de avaliação desconhecido: {evaluation_scope}")
+        if evaluation_scope == "training_protocol" and not protocol_hash:
+            raise ValueError("Gate de protocolo exige protocol_hash")
         seed = seed if seed is not None else self.settings.backtest.random_seed
         prepared_market = market.copy()
         if missing_fraction > 0 and enriched_override is None:
             rng = np.random.default_rng(seed)
             keep = rng.random(len(prepared_market)) >= missing_fraction
             prepared_market = prepared_market.loc[keep].copy()
+        registry = MetaModelRegistry(self.paths)
+        model_bundle = registry.load_candidate(model_id) if model_id else None
         generator = SignalGenerator(
             self.settings.strategy,
-            MetaModelRegistry(self.paths),
+            registry,
         )
         if enriched_override is None:
             enriched = generator.enrich(
                 prepared_market,
                 require_promoted_model=require_promoted_model,
+                model_bundle=model_bundle,
             )
         else:
             enriched = enriched_override.copy()
@@ -97,6 +110,9 @@ class EventBacktester:
                 "signal_delay_hours": signal_delay_hours,
                 "missing_fraction": missing_fraction,
                 "seed": seed,
+                "model_id": model_id,
+                "evaluation_scope": evaluation_scope,
+                "protocol_hash": protocol_hash,
             },
             sort_keys=True,
         ).encode()
@@ -272,27 +288,105 @@ class EventBacktester:
             monte_carlo_samples=self.settings.backtest.monte_carlo_samples,
             seed=seed,
         )
-        if cost_multiplier >= 2.0:
+        stress_results: dict[str, dict[str, float]] = {}
+        if not run_stress_suite or cost_multiplier >= 2.0:
             stressed = metrics
         else:
-            stressed = self.run(
+            costs = self.run(
                 market,
-                source=f"{source}-stress",
+                source=f"{source}-stress-costs-2x",
                 dataset_hash=dataset_hash,
                 require_promoted_model=require_promoted_model,
                 cost_multiplier=2.0,
-                signal_delay_hours=max(2, signal_delay_hours),
+                signal_delay_hours=signal_delay_hours,
+                seed=seed,
+                persist=False,
+                enriched_override=enriched,
+                model_id=model_id,
+                run_stress_suite=False,
+            ).metrics
+            delayed = self.run(
+                market,
+                source=f"{source}-stress-delay",
+                dataset_hash=dataset_hash,
+                cost_multiplier=cost_multiplier,
+                signal_delay_hours=max(2, signal_delay_hours + 1),
+                seed=seed,
+                persist=False,
+                enriched_override=enriched,
+                model_id=model_id,
+                run_stress_suite=False,
+            ).metrics
+            adverse = enriched.copy()
+            adverse["funding_rate"] = np.where(
+                adverse["signal_raw"] >= 0,
+                adverse["funding_rate"].abs() + 0.0001,
+                -(adverse["funding_rate"].abs() + 0.0001),
+            )
+            adverse_metrics = self.run(
+                market,
+                source=f"{source}-stress-adverse",
+                dataset_hash=dataset_hash,
+                cost_multiplier=cost_multiplier,
+                signal_delay_hours=signal_delay_hours,
                 missing_fraction=max(missing_fraction, 0.005),
                 seed=seed,
                 persist=False,
-                enriched_override=enriched_override,
+                enriched_override=adverse,
+                model_id=model_id,
+                run_stress_suite=False,
             ).metrics
-        model_hash = self._promoted_hash()
+            perturbed = enriched.copy()
+            perturbed["signal"] = perturbed["signal"].where(
+                perturbed["setup_score"] >= self.settings.strategy.ml_probability_threshold + 0.03,
+                0,
+            )
+            perturbed_metrics = self.run(
+                market,
+                source=f"{source}-stress-parameters",
+                dataset_hash=dataset_hash,
+                cost_multiplier=cost_multiplier,
+                signal_delay_hours=signal_delay_hours,
+                seed=seed,
+                persist=False,
+                enriched_override=perturbed,
+                model_id=model_id,
+                run_stress_suite=False,
+            ).metrics
+            stressed = costs
+            stress_results = {
+                "costs_2x": costs.summary,
+                "delay_one_candle": delayed.summary,
+                "missing_and_adverse_funding": adverse_metrics.summary,
+                "parameter_perturbation": perturbed_metrics.summary,
+            }
+        model_binding: dict[str, Any]
+        if evaluation_scope == "training_protocol":
+            from orizzonte_desk.ml import git_commit_fingerprint, research_code_fingerprint
+
+            resolved_model_hash = None
+            model_binding = {
+                "code_hash": research_code_fingerprint(),
+                "commit_hash": git_commit_fingerprint(self.paths.root),
+            }
+        else:
+            resolved_model_hash, model_binding = self._model_release(model_id)
+        model_hash = resolved_model_hash if evaluation_scope == "candidate" else None
+        dataset_hashes = tuple(value for value in (dataset_hash,) if value)
+        release_binding = {
+            **model_binding,
+            "dataset_hashes": sorted(dataset_hashes or model_binding.get("dataset_hashes", [])),
+            "config_fingerprint": stable_fingerprint(self.settings.model_dump(mode="json")),
+            "model_hash": model_hash,
+            "evaluation_scope": evaluation_scope,
+        }
+        if protocol_hash:
+            release_binding["protocol_hash"] = protocol_hash
         gate = evaluate_gate(
             metrics.summary,
             metrics.by_symbol,
             stressed.summary,
-            dataset_hashes=(dataset_hash,) if dataset_hash else (),
+            dataset_hashes=dataset_hashes,
             model_hash=model_hash,
         )
         run_dir = self.paths.reports / run_id
@@ -314,6 +408,7 @@ class EventBacktester:
                         "by_symbol": metrics.by_symbol,
                         "by_direction": metrics.by_direction,
                         "stress": stressed.summary,
+                        "stress_suite": stress_results,
                         "source": source,
                         "dataset_hash": dataset_hash,
                     },
@@ -322,14 +417,23 @@ class EventBacktester:
                 ),
                 encoding="utf-8",
             )
-            save_gate(gate, gate_path)
+            save_gate(gate, gate_path, release_binding=release_binding)
             artifacts = {
                 "equity": equity_path,
                 "trades": trades_path,
                 "metrics": metrics_path,
                 "gate": gate_path,
             }
-        return BacktestResult(run_id, trades, equity_frame, metrics, stressed, gate_path, artifacts)
+        return BacktestResult(
+            run_id,
+            trades,
+            equity_frame,
+            metrics,
+            stressed,
+            gate_path,
+            artifacts,
+            stress_results,
+        )
 
     def _open_position(
         self,
@@ -503,12 +607,24 @@ class EventBacktester:
                     result[(left, right)] = float(correlation)
         return result
 
-    def _promoted_hash(self) -> str | None:
-        pointer = self.paths.models / "promoted.json"
+    def _model_release(self, model_id: str | None) -> tuple[str | None, dict[str, Any]]:
+        pointer = (
+            self.paths.models / f"{model_id}.json"
+            if model_id
+            else self.paths.models / "promoted.json"
+        )
         if not pointer.exists():
-            return None
-        value = json.loads(pointer.read_text(encoding="utf-8")).get("promoted_hash")
-        return cast(str | None, value)
+            from orizzonte_desk.ml import git_commit_fingerprint, research_code_fingerprint
+
+            return None, {
+                "code_hash": research_code_fingerprint(),
+                "commit_hash": git_commit_fingerprint(self.paths.root),
+            }
+        payload = json.loads(pointer.read_text(encoding="utf-8"))
+        model_hash = payload.get("model_hash") or payload.get("promoted_hash")
+        return cast(str | None, model_hash), cast(
+            dict[str, Any], payload.get("release_binding", {})
+        )
 
 
 def walk_forward_windows(
@@ -558,6 +674,8 @@ class WalkForwardEvaluator:
     ) -> BacktestResult:
         from orizzonte_desk.ml import MetaModelRegistry
 
+        if market.attrs.get("dataset_role") == "external_holdout":
+            raise ValueError("Walk-forward não pode treinar no external_holdout")
         features = prepare_features(market, self.settings.strategy)
         windows = walk_forward_windows(
             features["timestamp"],
@@ -583,7 +701,13 @@ class WalkForwardEvaluator:
             ].copy()
             if test.empty:
                 continue
-            trained = registry.train(fit, seed=self.settings.backtest.random_seed + index)
+            trained = registry.train(
+                fit,
+                seed=self.settings.backtest.random_seed + index,
+                dataset_role="development",
+                dataset_hashes=(dataset_hash,),
+                config_fingerprint=stable_fingerprint(self.settings.model_dump(mode="json")),
+            )
             bundle = joblib.load(trained.model_path)
             candidates = test["signal_raw"] != 0
             test["ml_probability"] = 0.0
@@ -615,11 +739,23 @@ class WalkForwardEvaluator:
             .sort_values(["timestamp", "symbol"])
             .drop_duplicates(["timestamp", "symbol"], keep="first")
         )
+        oos.attrs.update(market.attrs)
+        protocol_hash = stable_fingerprint(
+            {
+                "anchored": True,
+                "purge_hours": 24,
+                "embargo_hours": 24,
+                "dataset_hash": dataset_hash,
+                "folds": fold_manifest,
+            }
+        )
         result = EventBacktester(self.settings, self.paths).run(
             market,
             source=f"{source}-walkforward-oos",
             dataset_hash=dataset_hash,
             enriched_override=oos,
+            evaluation_scope="training_protocol",
+            protocol_hash=protocol_hash,
         )
         manifest_path = result.gate_path.parent / "walk-forward.json"
         manifest_path.write_text(
@@ -628,6 +764,7 @@ class WalkForwardEvaluator:
                     "anchored": True,
                     "purge_hours": 24,
                     "embargo_hours": 24,
+                    "protocol_hash": protocol_hash,
                     "folds": fold_manifest,
                     "oos_start": pd.Timestamp(oos["timestamp"].min()).isoformat(),
                     "oos_end": pd.Timestamp(oos["timestamp"].max()).isoformat(),
