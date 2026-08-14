@@ -6,6 +6,7 @@ from typing import Any
 
 import httpx
 import pytest
+from click import unstyle
 from typer.testing import CliRunner
 
 import orizzonte_desk.cli as cli_module
@@ -203,4 +204,4 @@ def test_backtest_run_help_exposes_model_id(runner: CliRunner) -> None:
     result = runner.invoke(cli_module.app, ["backtest", "run", "--help"])
 
     assert result.exit_code == 0
-    assert "--model-id" in result.stdout
+    assert "--model-id" in unstyle(result.stdout)
