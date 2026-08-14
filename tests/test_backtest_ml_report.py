@@ -38,10 +38,15 @@ def test_model_candidate_can_be_trained(app_paths, settings) -> None:
     manifest = manager.generate_synthetic(hours=7000, seed=777)
     features = SignalGenerator(settings.strategy).enrich(manager.load(manifest.path))
     result = MetaModelRegistry(app_paths).train(features, seed=777)
+    repeated = MetaModelRegistry(app_paths).train(features, seed=777)
     assert result.model_path.exists()
     assert result.metadata_path.exists()
     assert 0 <= result.metrics["roc_auc"] <= 1
     assert len(result.model_hash) == 64
+    assert repeated.model_id == result.model_id
+    assert repeated.model_hash == result.model_hash
+    assert repeated.model_path.read_bytes() == result.model_path.read_bytes()
+    assert repeated.metadata_path.read_bytes() == result.metadata_path.read_bytes()
 
 
 def test_walk_forward_windows_are_anchored(app_paths, settings) -> None:

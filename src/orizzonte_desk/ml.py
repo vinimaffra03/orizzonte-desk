@@ -4,6 +4,7 @@ import hashlib
 import json
 import shutil
 import subprocess
+import tempfile
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -193,8 +194,6 @@ class MetaModelRegistry:
             "test_samples": float(len(test)),
             "positive_rate": float(candidates["label"].mean()),
         }
-        model_id = datetime.now(UTC).strftime("model-%Y%m%dT%H%M%S%fZ")
-        model_path = self.paths.models / f"{model_id}.joblib"
         resolved_dataset_hashes = dataset_hashes or tuple(
             value for value in (str(frame.attrs.get("dataset_hash", "")),) if value
         )
@@ -208,12 +207,28 @@ class MetaModelRegistry:
         bundle = {
             "model": calibrated,
             "features": FEATURE_COLUMNS,
-            "trained_at": datetime.now(UTC).isoformat(),
             "metrics": metrics,
             "release_binding": release_binding,
         }
-        joblib.dump(bundle, model_path, compress=3)
-        digest = file_hash(model_path)
+        with tempfile.NamedTemporaryFile(
+            dir=self.paths.models,
+            prefix=".model-",
+            suffix=".joblib.tmp",
+            delete=False,
+        ) as handle:
+            provisional_model = Path(handle.name)
+        try:
+            joblib.dump(bundle, provisional_model, compress=3)
+            digest = file_hash(provisional_model)
+            model_id = f"model-{digest[:24]}"
+            model_path = self.paths.models / f"{model_id}.joblib"
+            if model_path.exists():
+                if file_hash(model_path) != digest:
+                    raise RuntimeError("Colisão de modelo content-addressed detectada")
+            else:
+                provisional_model.replace(model_path)
+        finally:
+            provisional_model.unlink(missing_ok=True)
         metadata = {
             "model_id": model_id,
             "model_path": str(model_path),
