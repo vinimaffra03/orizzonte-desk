@@ -146,6 +146,7 @@ def _symbol_features(frame: pd.DataFrame, config: StrategyConfig) -> pd.DataFram
     base["forward_return_24h"] = forward_return
     base["realized_return_24h"] = forward_return * base["signal_raw"]
     risk_fraction = (base["stop_distance"] / base["close"]).replace(0, np.nan)
+    base["risk_fraction"] = risk_fraction
     base["forward_r_24h"] = forward_return / risk_fraction
     base["realized_r_24h"] = base["realized_return_24h"] / risk_fraction
     base["label"] = (
