@@ -14,9 +14,12 @@ def evaluate_gate(
     by_symbol: dict[str, dict[str, float]],
     stressed_metrics: dict[str, float],
     *,
+    evaluated_at: datetime,
     dataset_hashes: tuple[str, ...] = (),
     model_hash: str | None = None,
 ) -> GateResult:
+    if evaluated_at.tzinfo is None or evaluated_at.utcoffset() is None:
+        raise ValueError("evaluated_at precisa ser timezone-aware")
     positive_symbols = sum(by_symbol.get(symbol, {}).get("net_pnl", 0.0) > 0 for symbol in SYMBOLS)
     checks = {
         "sharpe_oos": metrics.get("sharpe", 0.0) >= 1.0,
@@ -34,7 +37,7 @@ def evaluate_gate(
     numeric["stress_net_profit"] = stressed_metrics.get("net_profit", 0.0)
     return GateResult(
         passed=all(checks.values()),
-        evaluated_at=datetime.now(UTC),
+        evaluated_at=evaluated_at.astimezone(UTC),
         checks=checks,
         metrics=numeric,
         reasons=reasons,
@@ -53,12 +56,19 @@ def save_gate(
     payload = result.model_dump(mode="json")
     if release_binding is not None:
         payload["release_binding"] = release_binding
-    path.write_text(json.dumps(payload, indent=2, ensure_ascii=False), encoding="utf-8")
+    path.write_text(
+        json.dumps(payload, indent=2, ensure_ascii=False, sort_keys=True),
+        encoding="utf-8",
+        newline="\n",
+    )
     return path
 
 
 def load_combined_gate(paths: list[Path]) -> dict[str, Any]:
-    payloads = [json.loads(path.read_text(encoding="utf-8")) for path in paths]
+    payloads = sorted(
+        [json.loads(path.read_text(encoding="utf-8")) for path in paths],
+        key=lambda payload: json.dumps(payload, sort_keys=True, separators=(",", ":")),
+    )
     bindings = [item.get("release_binding", {}) for item in payloads]
     shared_keys = ("config_fingerprint", "code_hash", "commit_hash")
     shared_invariants_match = (
@@ -124,14 +134,35 @@ def load_combined_gate(paths: list[Path]) -> dict[str, Any]:
         and protocol_binding_valid
     )
     protocol_hashes = sorted({str(binding["protocol_hash"]) for _, binding in protocol_pairs})
+    evaluated_timestamps: list[datetime] = []
+    timestamps_valid = bool(payloads)
+    for payload in payloads:
+        raw_evaluated_at = payload.get("evaluated_at")
+        if not raw_evaluated_at:
+            timestamps_valid = False
+            continue
+        try:
+            parsed = datetime.fromisoformat(str(raw_evaluated_at))
+            if parsed.tzinfo is None or parsed.utcoffset() is None:
+                timestamps_valid = False
+                continue
+            evaluated_timestamps.append(parsed.astimezone(UTC))
+        except (TypeError, ValueError):
+            timestamps_valid = False
+            continue
+    combined_evaluated_at = max(
+        evaluated_timestamps,
+        default=datetime(1970, 1, 1, tzinfo=UTC),
+    )
     return {
         "passed": (
             bool(payloads)
             and all(item.get("passed", False) for item in payloads)
             and bindings_match
+            and timestamps_valid
         ),
         "gates": payloads,
-        "bindings_match": bindings_match,
+        "bindings_match": bindings_match and timestamps_valid,
         "model_hash": candidate_model_hash,
         "release_binding": {
             **({key: bindings[0].get(key) for key in shared_keys} if bindings else {}),
@@ -144,5 +175,5 @@ def load_combined_gate(paths: list[Path]) -> dict[str, Any]:
                 {value for binding in bindings for value in binding.get("dataset_hashes", [])}
             ),
         },
-        "evaluated_at": datetime.now(UTC).isoformat(),
+        "evaluated_at": combined_evaluated_at.isoformat(),
     }

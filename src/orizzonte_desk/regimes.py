@@ -91,13 +91,17 @@ class RegimeStudyResult:
         decisions_parquet = output_dir / "regime-decisions.parquet"
         challenger_csv = output_dir / "regime-challenger.csv"
         challenger_parquet = output_dir / "regime-challenger.parquet"
-        summary_path.write_text(json.dumps(self.summary, indent=2), encoding="utf-8")
-        self.transitions.to_csv(transitions_csv, index=False)
-        self.decisions[self.decisions["policy"] == "weekly"].to_csv(decisions_csv, index=False)
-        self.ablation.to_csv(ablation_csv, index=False)
-        self.matrix.to_csv(matrix_csv, index=False)
+        summary_path.write_text(
+            json.dumps(self.summary, indent=2, sort_keys=True), encoding="utf-8", newline="\n"
+        )
+        self.transitions.to_csv(transitions_csv, index=False, lineterminator="\n")
+        self.decisions[self.decisions["policy"] == "weekly"].to_csv(
+            decisions_csv, index=False, lineterminator="\n"
+        )
+        self.ablation.to_csv(ablation_csv, index=False, lineterminator="\n")
+        self.matrix.to_csv(matrix_csv, index=False, lineterminator="\n")
         self.decisions.to_parquet(decisions_parquet, compression="zstd", index=False)
-        self.challenger.to_csv(challenger_csv, index=False)
+        self.challenger.to_csv(challenger_csv, index=False, lineterminator="\n")
         self.challenger.to_parquet(challenger_parquet, compression="zstd", index=False)
         return {
             "regime_study": summary_path,

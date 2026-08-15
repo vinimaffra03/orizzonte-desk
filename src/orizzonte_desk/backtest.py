@@ -75,7 +75,7 @@ class EventBacktester:
         objective_trades_only: bool = False,
         run_regime_study: bool = False,
     ) -> BacktestResult:
-        from orizzonte_desk.ml import MetaModelRegistry
+        from orizzonte_desk.ml import MetaModelRegistry, research_code_fingerprint
 
         if evaluation_scope not in {"candidate", "training_protocol"}:
             raise ValueError(f"Escopo de avaliação desconhecido: {evaluation_scope}")
@@ -118,6 +118,20 @@ class EventBacktester:
                 enriched = enriched.loc[rng.random(len(enriched)) >= missing_fraction].copy()
         enriched["timestamp"] = pd.to_datetime(enriched["timestamp"], utc=True)
         enriched = enriched.sort_values(["timestamp", "symbol"]).reset_index(drop=True)
+        code_hash = research_code_fingerprint()
+        correlations_fingerprint: str | bool = correlations_override is not None
+        if persist and correlations_override is not None:
+            correlations_fingerprint = stable_fingerprint(
+                [
+                    {
+                        "timestamp": pd.Timestamp(timestamp).isoformat(),
+                        "pairs": [
+                            [left, right, value] for (left, right), value in sorted(values.items())
+                        ],
+                    }
+                    for timestamp, values in sorted(correlations_override.items())
+                ]
+            )
         run_fingerprint = json.dumps(
             {
                 "source": source,
@@ -131,8 +145,9 @@ class EventBacktester:
                 "evaluation_scope": evaluation_scope,
                 "protocol_hash": protocol_hash,
                 "metrics_monte_carlo_samples": metrics_monte_carlo_samples,
-                "correlations_override": correlations_override is not None,
+                "correlations_override": correlations_fingerprint,
                 "run_regime_study": run_regime_study,
+                "research_code_hash": code_hash,
             },
             sort_keys=True,
         ).encode()
@@ -410,11 +425,11 @@ class EventBacktester:
             }
         model_binding: dict[str, Any]
         if evaluation_scope == "training_protocol":
-            from orizzonte_desk.ml import git_commit_fingerprint, research_code_fingerprint
+            from orizzonte_desk.ml import git_commit_fingerprint
 
             resolved_model_hash = None
             model_binding = {
-                "code_hash": research_code_fingerprint(),
+                "code_hash": code_hash,
                 "commit_hash": git_commit_fingerprint(self.paths.root),
             }
         else:
@@ -430,10 +445,18 @@ class EventBacktester:
         }
         if protocol_hash:
             release_binding["protocol_hash"] = protocol_hash
+        evaluated_at = pd.Timestamp(equity_frame["timestamp"].max())
+        if pd.isna(evaluated_at):
+            raise ValueError("Gate quantitativo exige ao menos um timestamp de mercado")
+        if evaluated_at.tzinfo is None:
+            evaluated_at = evaluated_at.tz_localize("UTC")
+        else:
+            evaluated_at = evaluated_at.tz_convert("UTC")
         gate = evaluate_gate(
             metrics.summary,
             metrics.by_symbol,
             stressed.summary,
+            evaluated_at=evaluated_at.to_pydatetime(),
             dataset_hashes=dataset_hashes,
             model_hash=model_hash,
         )
@@ -450,9 +473,9 @@ class EventBacktester:
             equity_path = run_dir / "equity.csv"
             trades_path = run_dir / "trades.csv"
             metrics_path = run_dir / "metrics.json"
-            equity_frame.to_csv(equity_path, index=False)
+            equity_frame.to_csv(equity_path, index=False, lineterminator="\n")
             pd.DataFrame([trade.model_dump(mode="json") for trade in trades]).to_csv(
-                trades_path, index=False
+                trades_path, index=False, lineterminator="\n"
             )
             metrics_path.write_text(
                 json.dumps(
@@ -467,8 +490,10 @@ class EventBacktester:
                     },
                     indent=2,
                     ensure_ascii=False,
+                    sort_keys=True,
                 ),
                 encoding="utf-8",
+                newline="\n",
             )
             if gate_eligible:
                 release_binding["gate_eligible"] = True
@@ -628,7 +653,7 @@ class EventBacktester:
             .rename("events")
             .reset_index()
         )
-        by_fold.to_csv(fold_path, index=False)
+        by_fold.to_csv(fold_path, index=False, lineterminator="\n")
         summary_path.write_text(
             json.dumps(
                 {
@@ -645,8 +670,10 @@ class EventBacktester:
                     ),
                 },
                 indent=2,
+                sort_keys=True,
             ),
             encoding="utf-8",
+            newline="\n",
         )
         calibration = candidates.dropna(subset=["ml_probability", "label"]).copy()
         if calibration.empty:
@@ -685,7 +712,7 @@ class EventBacktester:
             )
             calibration_frame["model_hash"] = model_hash
             calibration_frame["dataset_hash"] = dataset_hash
-        calibration_frame.to_csv(calibration_path, index=False)
+        calibration_frame.to_csv(calibration_path, index=False, lineterminator="\n")
         return {
             "funnel_events": event_path,
             "funnel_summary": summary_path,
@@ -834,7 +861,7 @@ class EventBacktester:
                 }
             )
         ablation_path = artifacts["strategy_ablation_csv"]
-        pd.DataFrame(evaluation_rows).to_csv(ablation_path, index=False)
+        pd.DataFrame(evaluation_rows).to_csv(ablation_path, index=False, lineterminator="\n")
         event_path = regime_dir / "regime-event-driven.json"
         event_path.write_text(
             json.dumps(
@@ -852,12 +879,16 @@ class EventBacktester:
                     "costs_2x": stressed.metrics.summary,
                 },
                 indent=2,
+                sort_keys=True,
             ),
             encoding="utf-8",
+            newline="\n",
         )
         summary = dict(regime_study.summary)
         summary["event_driven_decision"] = json.loads(event_path.read_text(encoding="utf-8"))
-        artifacts["regime_study"].write_text(json.dumps(summary, indent=2), encoding="utf-8")
+        artifacts["regime_study"].write_text(
+            json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8", newline="\n"
+        )
         artifacts["regime_event_driven_json"] = event_path
         return artifacts
 
@@ -1213,8 +1244,10 @@ class WalkForwardEvaluator:
                     "oos_end": pd.Timestamp(oos["timestamp"].max()).isoformat(),
                 },
                 indent=2,
+                sort_keys=True,
             ),
             encoding="utf-8",
+            newline="\n",
         )
         result.artifacts["walk_forward"] = manifest_path
         return result

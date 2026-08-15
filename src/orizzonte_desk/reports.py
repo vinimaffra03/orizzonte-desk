@@ -33,7 +33,7 @@ REPORT_TEMPLATE = """<!doctype html>
 <section class="grid">
 {% for label, value in cards %}<article class="card"><div class="label">{{ label }}</div><div class="value">{{ value }}</div></article>{% endfor %}
 </section>
-<section class="panel"><h2>Equity & Drawdown</h2>{{ chart }}</section>
+<section class="panel"><h2>Equity & Drawdown</h2>{{ chart | safe }}</section>
 <section class="panel"><h2>Gate live</h2><div class="{{ 'ok' if gate.passed else 'bad' }}">{{ 'APROVADO' if gate.passed else 'REPROVADO' }}</div><table><tbody>{% for name, passed in gate.checks.items() %}<tr><td>{{ name }}</td><td class="{{ 'ok' if passed else 'bad' }}">{{ 'OK' if passed else 'FALHA' }}</td></tr>{% endfor %}</tbody></table></section>
 <section class="panel"><h2>Por ativo</h2><table><thead><tr><th>Ativo</th><th>PnL</th><th>Trades</th><th>Win rate</th><th>Profit factor</th></tr></thead><tbody>{% for symbol, row in by_symbol.items() %}<tr><td>{{ symbol }}</td><td>{{ '%.2f'|format(row.net_pnl) }}</td><td>{{ row.trades|int }}</td><td>{{ '%.1f%%'|format(row.win_rate*100) }}</td><td>{{ '%.2f'|format(row.profit_factor) }}</td></tr>{% endfor %}</tbody></table></section>
 <section class="panel"><h2>Por direção</h2><table><thead><tr><th>Direção</th><th>PnL</th><th>Trades</th><th>Expectância</th><th>Custos</th></tr></thead><tbody>{% for direction, row in by_direction.items() %}<tr><td>{{ direction }}</td><td>{{ '%.2f'|format(row.net_pnl) }}</td><td>{{ row.trades|int }}</td><td>{{ '%.2f'|format(row.expectancy) }}</td><td>{{ '%.2f'|format(row.fees + row.funding + row.slippage) }}</td></tr>{% endfor %}</tbody></table></section>
@@ -103,6 +103,12 @@ def generate_report(result: BacktestResult) -> Path:
         ("MC retorno P05", _percentage(metrics.get("mc_final_return_p05", 0))),
         ("MC DD P95", _percentage(metrics.get("mc_max_drawdown_p95", 0))),
     ]
+    artifact_references: dict[str, str] = {}
+    for key, value in result.artifacts.items():
+        try:
+            artifact_references[key] = value.resolve().relative_to(output_dir.resolve()).as_posix()
+        except ValueError:
+            artifact_references[key] = value.name
     manifest = {
         "run_id": result.run_id,
         "metrics": metrics,
@@ -110,7 +116,7 @@ def generate_report(result: BacktestResult) -> Path:
         "stress_suite": result.stress_results,
         "by_symbol": result.metrics.by_symbol,
         "by_direction": result.metrics.by_direction,
-        "artifacts": {key: str(value) for key, value in result.artifacts.items()},
+        "artifacts": artifact_references,
     }
     gate_binding_value = gate.get("release_binding", {})
     gate_binding = gate_binding_value if isinstance(gate_binding_value, dict) else {}
@@ -134,28 +140,36 @@ def generate_report(result: BacktestResult) -> Path:
         .render(
             run_id=result.run_id,
             cards=cards,
-            chart=figure.to_html(full_html=False, include_plotlyjs="cdn"),
+            chart=figure.to_html(
+                full_html=False,
+                include_plotlyjs="cdn",
+                div_id=f"orizzonte-equity-{result.run_id}",
+            ),
             gate=gate,
             by_symbol=result.metrics.by_symbol,
             by_direction=result.metrics.by_direction,
             stress_results=result.stress_results,
-            research_manifest=json.dumps(research_manifest, indent=2, ensure_ascii=False),
-            manifest=json.dumps(manifest, indent=2, ensure_ascii=False),
+            research_manifest=json.dumps(
+                research_manifest, indent=2, ensure_ascii=False, sort_keys=True
+            ),
+            manifest=json.dumps(manifest, indent=2, ensure_ascii=False, sort_keys=True),
         )
     )
     output = output_dir / "report.html"
-    output.write_text(html, encoding="utf-8")
+    output.write_text(html, encoding="utf-8", newline="\n")
     (output_dir / "summary.json").write_text(
-        json.dumps(manifest, indent=2, ensure_ascii=False), encoding="utf-8"
+        json.dumps(manifest, indent=2, ensure_ascii=False, sort_keys=True),
+        encoding="utf-8",
+        newline="\n",
     )
     pd.DataFrame.from_dict(result.metrics.by_symbol, orient="index").rename_axis("symbol").to_csv(
-        output_dir / "metrics-by-symbol.csv"
+        output_dir / "metrics-by-symbol.csv", lineterminator="\n"
     )
     pd.DataFrame.from_dict(result.metrics.by_direction, orient="index").rename_axis(
         "direction"
-    ).to_csv(output_dir / "metrics-by-direction.csv")
+    ).to_csv(output_dir / "metrics-by-direction.csv", lineterminator="\n")
     pd.DataFrame.from_dict(result.stress_results, orient="index").rename_axis("scenario").to_csv(
-        output_dir / "stress-sensitivity.csv"
+        output_dir / "stress-sensitivity.csv", lineterminator="\n"
     )
     return output
 

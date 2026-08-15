@@ -434,7 +434,7 @@ class MetaModelRegistry:
         final_decisions["stage"] = "outer_holdout"
         final_csv = decision_dir / f"{selection.policy.policy_id}-outer-holdout.csv"
         final_parquet = decision_dir / f"{selection.policy.policy_id}-outer-holdout.parquet"
-        final_decisions.to_csv(final_csv, index=False)
+        final_decisions.to_csv(final_csv, index=False, lineterminator="\n")
         final_decisions.to_parquet(final_parquet, compression="zstd", index=False)
         complete_funnel = {
             **selection.funnel,
@@ -444,7 +444,11 @@ class MetaModelRegistry:
             "outer_holdout_accepted": int(final_decisions["accepted"].sum()),
         }
         funnel_path = decision_dir / f"{selection.policy.policy_id}-complete-funnel.json"
-        funnel_path.write_text(json.dumps(complete_funnel, indent=2), encoding="utf-8")
+        funnel_path.write_text(
+            json.dumps(complete_funnel, indent=2, sort_keys=True),
+            encoding="utf-8",
+            newline="\n",
+        )
         metrics.update(
             {
                 "decision_threshold": selection.policy.probability_threshold,
@@ -474,7 +478,9 @@ class MetaModelRegistry:
             },
         }
         metadata_path = self.paths.models / f"{model_id}.json"
-        metadata_path.write_text(json.dumps(metadata, indent=2), encoding="utf-8")
+        metadata_path.write_text(
+            json.dumps(metadata, indent=2, sort_keys=True), encoding="utf-8", newline="\n"
+        )
         return TrainingResult(
             model_id,
             model_path,
@@ -549,7 +555,9 @@ class MetaModelRegistry:
             "gate_hash": file_hash(gate_path),
             "promoted_hash": file_hash(promoted_model),
         }
-        self.promoted_pointer.write_text(json.dumps(pointer, indent=2), encoding="utf-8")
+        self.promoted_pointer.write_text(
+            json.dumps(pointer, indent=2, sort_keys=True), encoding="utf-8", newline="\n"
+        )
         return pointer
 
     def load_promoted(self) -> dict[str, Any] | None:

@@ -667,9 +667,12 @@ def backtest_compare(
     hyperliquid_gate: Path | None = typer.Option(None, exists=True, dir_okay=False),
 ) -> None:
     paths, _, _, _ = context()
-    gates = sorted(
-        paths.reports.glob("*/gate.json"), key=lambda item: item.stat().st_mtime, reverse=True
-    )
+
+    def gate_order(path: Path) -> tuple[str, str]:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        return str(payload.get("evaluated_at", "")), path.parent.name
+
+    gates = sorted(paths.reports.glob("*/gate.json"), key=gate_order, reverse=True)
     if long_gate is None:
         long_gate = next((item for item in gates if "binance" in item.parent.name), None)
     if hyperliquid_gate is None:
@@ -678,7 +681,11 @@ def backtest_compare(
         fail("São necessários um gate Binance longo e um gate Hyperliquid recente")
     combined = load_combined_gate([long_gate, hyperliquid_gate])
     output = paths.reports / "live-approval.json"
-    output.write_text(json.dumps(combined, indent=2, ensure_ascii=False), encoding="utf-8")
+    output.write_text(
+        json.dumps(combined, indent=2, ensure_ascii=False, sort_keys=True),
+        encoding="utf-8",
+        newline="\n",
+    )
     console.print_json(data={**combined, "path": str(output)})
 
 

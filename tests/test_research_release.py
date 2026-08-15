@@ -173,6 +173,7 @@ def test_combined_gate_binds_walk_forward_protocol_to_candidate(tmp_path) -> Non
         json.dumps(
             {
                 "passed": True,
+                "evaluated_at": "2026-07-31T00:00:00+00:00",
                 "release_binding": {
                     **common,
                     "model_hash": None,
@@ -189,6 +190,7 @@ def test_combined_gate_binds_walk_forward_protocol_to_candidate(tmp_path) -> Non
         json.dumps(
             {
                 "passed": True,
+                "evaluated_at": "2026-08-14T00:00:00+00:00",
                 "model_hash": "a" * 64,
                 "release_binding": {
                     **common,
@@ -213,6 +215,8 @@ def test_combined_gate_binds_walk_forward_protocol_to_candidate(tmp_path) -> Non
         "development",
         "external-holdout",
     ]
+    assert combined["evaluated_at"] == "2026-08-14T00:00:00+00:00"
+    assert load_combined_gate([candidate, protocol]) == combined
 
 
 def test_combined_gate_rejects_missing_or_divergent_candidate_policy(tmp_path) -> None:

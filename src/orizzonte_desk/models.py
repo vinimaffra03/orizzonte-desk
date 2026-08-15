@@ -143,7 +143,7 @@ class RiskSnapshot(StrictModel):
 
 class GateResult(StrictModel):
     passed: bool
-    evaluated_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
+    evaluated_at: datetime
     checks: dict[str, bool]
     metrics: dict[str, float]
     reasons: tuple[str, ...] = ()

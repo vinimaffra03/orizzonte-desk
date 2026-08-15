@@ -169,11 +169,15 @@ class DecisionSelection:
         parquet_path = output_dir / f"{self.policy.policy_id}-diagnostics.parquet"
         funnel_path = output_dir / f"{self.policy.policy_id}-funnel.json"
         policy_path.write_text(
-            json.dumps(self.policy.to_payload(), indent=2, ensure_ascii=False), encoding="utf-8"
+            json.dumps(self.policy.to_payload(), indent=2, ensure_ascii=False, sort_keys=True),
+            encoding="utf-8",
+            newline="\n",
         )
-        self.diagnostics.to_csv(csv_path, index=False)
+        self.diagnostics.to_csv(csv_path, index=False, lineterminator="\n")
         self.diagnostics.to_parquet(parquet_path, compression="zstd", index=False)
-        funnel_path.write_text(json.dumps(self.funnel, indent=2), encoding="utf-8")
+        funnel_path.write_text(
+            json.dumps(self.funnel, indent=2, sort_keys=True), encoding="utf-8", newline="\n"
+        )
         return {
             "decision_policy": policy_path,
             "decision_diagnostics_csv": csv_path,
