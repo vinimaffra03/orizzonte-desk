@@ -7,6 +7,7 @@ import pytest
 
 from orizzonte_desk.data import DatasetManager, sha256_file
 from orizzonte_desk.features import prepare_features
+from orizzonte_desk.regimes import build_regime_arms
 
 
 def test_synthetic_dataset_is_versioned_and_valid(app_paths, settings) -> None:
@@ -51,6 +52,10 @@ def test_features_do_not_change_past_when_future_is_appended(app_paths, settings
     past = frame[frame["timestamp"] <= cutoff]
     full_features = prepare_features(frame, settings.strategy)
     past_features = prepare_features(past, settings.strategy)
+    assert full_features["risk_fraction"].equals(
+        (full_features["stop_distance"] / full_features["close"]).replace(0, float("nan"))
+    )
+    assert not build_regime_arms(full_features).empty
     columns = [
         "timestamp",
         "symbol",
@@ -58,6 +63,7 @@ def test_features_do_not_change_past_when_future_is_appended(app_paths, settings
         "daily_trend",
         "weekly_trend",
         "signal_raw",
+        "risk_fraction",
     ]
     expected = full_features[full_features["timestamp"] <= cutoff][columns].reset_index(drop=True)
     actual = past_features[columns].reset_index(drop=True)

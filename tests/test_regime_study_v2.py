@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pandas as pd
 
+from orizzonte_desk.backtest import _mask_unmatured_forward_outcomes
 from orizzonte_desk.regimes import REGIME_ARMS, RegimeStudy
 
 
@@ -40,6 +41,29 @@ def _study() -> RegimeStudy:
         lcb_quantile=0.05,
         seed=9,
     )
+
+
+def test_walk_forward_hides_outcomes_crossing_fold_end() -> None:
+    period_end = pd.Timestamp("2026-04-01T00:00:00Z")
+    frame = pd.DataFrame(
+        {
+            "timestamp": [
+                period_end - pd.Timedelta(hours=25),
+                period_end - pd.Timedelta(hours=24),
+                period_end - pd.Timedelta(hours=1),
+            ],
+            "forward_return_24h": [0.1, 0.2, 0.3],
+            "realized_return_24h": [0.1, 0.2, 0.3],
+            "forward_r_24h": [1.0, 2.0, 3.0],
+            "realized_r_24h": [1.0, 2.0, 3.0],
+            "label": [1.0, 1.0, 1.0],
+        }
+    )
+
+    masked = _mask_unmatured_forward_outcomes(frame, period_end=period_end)
+
+    assert masked.loc[0, "forward_return_24h"] == 0.1
+    assert masked.loc[1:, list(frame.columns[1:])].isna().all().all()
 
 
 def test_formal_regime_study_is_causal_and_challenger_only(tmp_path) -> None:

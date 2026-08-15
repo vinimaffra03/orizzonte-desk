@@ -47,6 +47,34 @@ class _OpenPosition:
     mfe: float = 0.0
 
 
+_FORWARD_OUTCOME_COLUMNS = (
+    "forward_return_24h",
+    "realized_return_24h",
+    "forward_r_24h",
+    "realized_r_24h",
+    "label",
+)
+
+
+def _mask_unmatured_forward_outcomes(
+    frame: pd.DataFrame,
+    *,
+    period_end: pd.Timestamp,
+) -> pd.DataFrame:
+    """Hide labels whose 24-hour outcome crosses an evaluation boundary."""
+    result = frame.copy()
+    timestamps = pd.to_datetime(result["timestamp"], utc=True)
+    normalized_end = pd.Timestamp(period_end)
+    if normalized_end.tzinfo is None:
+        normalized_end = normalized_end.tz_localize("UTC")
+    else:
+        normalized_end = normalized_end.tz_convert("UTC")
+    matured = timestamps + pd.Timedelta(hours=24) < normalized_end
+    available = [column for column in _FORWARD_OUTCOME_COLUMNS if column in result]
+    result.loc[~matured, available] = np.nan
+    return result
+
+
 class EventBacktester:
     def __init__(self, settings: Settings, paths: AppPaths) -> None:
         self.settings = settings
@@ -1162,6 +1190,7 @@ class WalkForwardEvaluator:
             test = features[
                 (features["timestamp"] >= test_start) & (features["timestamp"] < window["test_end"])
             ].copy()
+            test = _mask_unmatured_forward_outcomes(test, period_end=window["test_end"])
             if test.empty:
                 continue
             trained = registry.train(
