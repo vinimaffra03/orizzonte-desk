@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import json
+
+import numpy as np
 import pandas as pd
 
-from orizzonte_desk.backtest import _mask_unmatured_forward_outcomes
+from orizzonte_desk.backtest import _json_default, _mask_unmatured_forward_outcomes
 from orizzonte_desk.regimes import REGIME_ARMS, RegimeStudy
 
 
@@ -41,6 +44,22 @@ def _study() -> RegimeStudy:
         lcb_quantile=0.05,
         seed=9,
     )
+
+
+def test_regime_event_json_normalizes_numpy_scalars() -> None:
+    payload = {
+        "criterion": np.bool_(True),
+        "positive_assets": np.int64(3),
+        "probability": np.float64(0.95),
+    }
+
+    encoded = json.dumps(payload, sort_keys=True, default=_json_default)
+
+    assert json.loads(encoded) == {
+        "criterion": True,
+        "positive_assets": 3,
+        "probability": 0.95,
+    }
 
 
 def test_walk_forward_hides_outcomes_crossing_fold_end() -> None:
