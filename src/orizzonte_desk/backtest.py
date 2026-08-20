@@ -24,6 +24,13 @@ from orizzonte_desk.risk import RiskManager, RiskViolation
 from orizzonte_desk.strategy import SignalGenerator
 
 
+def _json_default(value: object) -> object:
+    """Convert NumPy scalar results to deterministic JSON-native values."""
+    if isinstance(value, np.generic):
+        return value.item()
+    raise TypeError(f"Object of type {type(value).__name__} is not JSON serializable")
+
+
 @dataclass(slots=True)
 class BacktestResult:
     run_id: str
@@ -699,6 +706,7 @@ class EventBacktester:
                 },
                 indent=2,
                 sort_keys=True,
+                default=_json_default,
             ),
             encoding="utf-8",
             newline="\n",
@@ -908,6 +916,7 @@ class EventBacktester:
                 },
                 indent=2,
                 sort_keys=True,
+                default=_json_default,
             ),
             encoding="utf-8",
             newline="\n",
@@ -915,7 +924,9 @@ class EventBacktester:
         summary = dict(regime_study.summary)
         summary["event_driven_decision"] = json.loads(event_path.read_text(encoding="utf-8"))
         artifacts["regime_study"].write_text(
-            json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8", newline="\n"
+            json.dumps(summary, indent=2, sort_keys=True, default=_json_default),
+            encoding="utf-8",
+            newline="\n",
         )
         artifacts["regime_event_driven_json"] = event_path
         return artifacts
